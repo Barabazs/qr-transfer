@@ -87,13 +87,17 @@ better than photos anyway.
 ## Deploy to Ethereum Swarm
 
 ```bash
-swarm-cli upload index.html --stamp <batch-id>
+mkdir -p dist && cp index.html og.png dist/
+swarm-cli upload dist --stamp <batch-id>
 ```
 
 Needs a Bee node with a funded postage batch — or upload without a node via
-[Beeport](https://beeport.ethswarm.org/). One file, one reference. The page makes zero
-external requests (enforced by its CSP meta tag), so it works from any gateway and
-offline.
+[Beeport](https://beeport.ethswarm.org/). Uploading a folder makes Bee build a manifest
+and auto-detect `index.html` as the index document, so `/` and `/og.png` both resolve
+from one reference. `og.png` is served to crawlers (Facebook/X/Slack/Discord link
+previews) from that same manifest — it's never fetched by the page itself, so the zero
+external-request guarantee for the running app (enforced by its CSP meta tag) is
+unaffected.
 
 ## Vendored libraries
 
