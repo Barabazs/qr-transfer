@@ -322,7 +322,7 @@ footer a { color: var(--ink); text-underline-offset: 2px; }
   <textarea id="send-text" placeholder="Paste or type text to send…" spellcheck="false"></textarea>
 
   <div class="drop" id="send-drop" tabindex="0" role="button" aria-label="Choose a file to send">
-    Drop a file here or click to choose — it will be sent as a base64 data URI
+    Drop, paste, or click to choose a file — it will be sent as a base64 data URI
   </div>
   <input type="file" id="send-file" hidden>
   <div id="send-filechip"></div>
@@ -13315,6 +13315,24 @@ async function setFile(file) {
     } catch { /* best-effort — never block sending on a failed scan */ }
   }
 }
+
+// clipboard paste — image or file, like attaching a screenshot in a chat compose box
+document.addEventListener('paste', (e) => {
+  if ($('panel-send').hidden) return;
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.kind !== 'file') continue;
+    const blob = item.getAsFile();
+    if (!blob) continue;
+    e.preventDefault();
+    const file = blob.name ? blob : new File([blob], 'pasted.' + (item.type.split('/')[1] || 'bin'), { type: item.type });
+    setFile(file);
+    sendDrop.classList.add('armed');
+    setTimeout(() => sendDrop.classList.remove('armed'), 300);
+    return;
+  }
+});
 
 function readPayload() {
   if (pickedFile) {
