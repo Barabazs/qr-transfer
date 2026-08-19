@@ -177,6 +177,16 @@ input[type="range"] { accent-color: var(--laser); width: 130px; }
 }
 .warn.strong { border-left-width: 6px; font-weight: 600; }
 
+#metadata-dialog {
+  max-width: 440px; width: calc(100% - 32px);
+  border: 2px solid var(--laser); border-radius: 2px;
+  padding: 20px; background: var(--card); color: var(--ink);
+  font-family: inherit;
+}
+#metadata-dialog::backdrop { background: rgba(0, 0, 0, 0.55); }
+#metadata-dialog p { font-size: 0.8125rem; line-height: 1.5; margin: 8px 0 0; }
+#metadata-dialog .actions { margin-top: 16px; display: flex; justify-content: flex-end; }
+
 .stage {
   position: relative; margin: 18px auto 0; padding: 26px;
   background: var(--stage); width: fit-content; max-width: 100%;
@@ -316,6 +326,7 @@ footer a { color: var(--ink); text-underline-offset: 2px; }
   </div>
   <input type="file" id="send-file" hidden>
   <div id="send-filechip"></div>
+  <div id="send-metawarn" role="status"></div>
 
   <div class="controls">
     <div class="ctl">
@@ -466,6 +477,14 @@ footer a { color: var(--ink); text-underline-offset: 2px; }
   transfers against the original before trusting the copy.
   <p class="byline">Prompted by <a href="https://x.com/barabazs_" target="_blank" rel="noopener">@barabazs_</a> · executed by Claude</p>
 </footer>
+
+<dialog id="metadata-dialog" aria-labelledby="metadata-dialog-title">
+  <span class="eyebrow" id="metadata-dialog-title">Heads up</span>
+  <p id="metadata-dialog-text"></p>
+  <div class="actions">
+    <button class="btn mini" id="metadata-dialog-ok">Got it</button>
+  </div>
+</dialog>
 
 <script>
 /* ===== VENDORED (verbatim, do not edit): qrcode-generator@2.0.4 — MIT, Kazuhiko Arase
@@ -12934,6 +12953,131 @@ function fmtSecs(s) {
   return Math.floor(s / 60) + ' min ' + Math.round(s % 60) + ' s';
 }
 
+// best-effort, read-only scan for embedded EXIF/XMP metadata — used to warn before
+// sending, never to modify bytes. Malformed input just yields no findings.
+const GPS_IFD_TAG = 0x8825;
+function tiffHasGpsTag(bytes, tiffStart) {
+  if (tiffStart + 8 > bytes.length) return false;
+  const b0 = bytes[tiffStart], b1 = bytes[tiffStart + 1];
+  let little;
+  if (b0 === 0x49 && b1 === 0x49) little = true;
+  else if (b0 === 0x4D && b1 === 0x4D) little = false;
+  else return false;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (dv.getUint16(tiffStart + 2, little) !== 42) return false;
+  const ifd0 = tiffStart + dv.getUint32(tiffStart + 4, little);
+  if (ifd0 < 0 || ifd0 + 2 > bytes.length) return false;
+  const n = dv.getUint16(ifd0, little);
+  for (let i = 0; i < n; i++) {
+    const entry = ifd0 + 2 + i * 12;
+    if (entry + 12 > bytes.length) break;
+    if (dv.getUint16(entry, little) === GPS_IFD_TAG) return true;
+  }
+  return false;
+}
+// PNG eXIf / WebP EXIF chunks hold raw TIFF; some encoders still prefix "Exif\0\0" — skip it if present
+function tiffStartAfterExifPrefix(bytes, offset) {
+  if (offset + 6 <= bytes.length && bytes[offset] === 0x45 && bytes[offset + 1] === 0x78 &&
+      bytes[offset + 2] === 0x69 && bytes[offset + 3] === 0x66 && bytes[offset + 4] === 0 && bytes[offset + 5] === 0) {
+    return offset + 6;
+  }
+  return offset;
+}
+function textHasGpsHint(bytes, start, end) {
+  const text = new TextDecoder('utf-8').decode(bytes.subarray(start, end));
+  return /GPSLatitude|exif:GPS/i.test(text);
+}
+function jpegMetaInfo(bytes) {
+  if (bytes[0] !== 0xFF || bytes[1] !== 0xD8) return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let pos = 2, hasExif = false, hasGps = false;
+  while (pos < bytes.length - 1) {
+    if (bytes[pos] !== 0xFF) { pos++; continue; }
+    let mpos = pos + 1;
+    while (mpos < bytes.length && bytes[mpos] === 0xFF) mpos++;
+    if (mpos >= bytes.length) break;
+    const marker = bytes[mpos];
+    const after = mpos + 1;
+    if (marker === 0xD9) break;                                  // EOI
+    if ((marker >= 0xD0 && marker <= 0xD7) || marker === 0x01) { pos = after; continue; } // no length field
+    if (after + 2 > bytes.length) break;
+    const segLen = dv.getUint16(after, false);
+    if (segLen < 2) break;
+    const dataStart = after + 2;
+    if (marker === 0xE1 && segLen >= 8 && dataStart + 6 <= bytes.length &&
+        bytes[dataStart] === 0x45 && bytes[dataStart + 1] === 0x78 && bytes[dataStart + 2] === 0x69 &&
+        bytes[dataStart + 3] === 0x66 && bytes[dataStart + 4] === 0 && bytes[dataStart + 5] === 0) {
+      hasExif = true;
+      if (tiffHasGpsTag(bytes, dataStart + 6)) hasGps = true;
+    }
+    if (marker === 0xDA) break;                                  // start of scan — no more marker segments
+    pos = after + segLen;
+  }
+  return { hasExif, hasGps };
+}
+function pngMetaInfo(bytes) {
+  const sig = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+  for (let i = 0; i < 8; i++) if (bytes[i] !== sig[i]) return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let pos = 8, hasExif = false, hasGps = false, hasXmp = false;
+  while (pos + 8 <= bytes.length) {
+    const len = dv.getUint32(pos, false);
+    const type = String.fromCharCode(bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]);
+    const dataStart = pos + 8;
+    if (dataStart + len + 4 > bytes.length) break;
+    if (type === 'eXIf') {
+      hasExif = true;
+      if (tiffHasGpsTag(bytes, tiffStartAfterExifPrefix(bytes, dataStart))) hasGps = true;
+    } else if (type === 'iTXt') {
+      let kwEnd = dataStart;
+      while (kwEnd < dataStart + len && bytes[kwEnd] !== 0) kwEnd++;
+      const keyword = new TextDecoder('latin1').decode(bytes.subarray(dataStart, kwEnd));
+      if (keyword === 'XML:com.adobe.xmp' && bytes[kwEnd + 1] === 0) {   // compression flag 0 = uncompressed
+        hasXmp = true;
+        let langEnd = kwEnd + 3;
+        while (langEnd < dataStart + len && bytes[langEnd] !== 0) langEnd++;
+        let tkEnd = langEnd + 1;
+        while (tkEnd < dataStart + len && bytes[tkEnd] !== 0) tkEnd++;
+        if (textHasGpsHint(bytes, tkEnd + 1, dataStart + len)) hasGps = true;
+      }
+    }
+    pos = dataStart + len + 4;                                   // + CRC
+    if (type === 'IEND') break;
+  }
+  return { hasExif: hasExif || hasXmp, hasGps };
+}
+function webpMetaInfo(bytes) {
+  if (bytes.length < 12) return null;
+  const riff = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
+  const webp = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
+  if (riff !== 'RIFF' || webp !== 'WEBP') return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let pos = 12, hasExif = false, hasGps = false, hasXmp = false;
+  while (pos + 8 <= bytes.length) {
+    const fourcc = String.fromCharCode(bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]);
+    const size = dv.getUint32(pos + 4, true);
+    const dataStart = pos + 8;
+    if (dataStart + size > bytes.length) break;
+    if (fourcc === 'EXIF') {
+      hasExif = true;
+      if (tiffHasGpsTag(bytes, tiffStartAfterExifPrefix(bytes, dataStart))) hasGps = true;
+    } else if (fourcc === 'XMP ') {
+      hasXmp = true;
+      if (textHasGpsHint(bytes, dataStart, dataStart + size)) hasGps = true;
+    }
+    pos = dataStart + size + (size % 2);                         // chunks are padded to even length
+  }
+  return { hasExif: hasExif || hasXmp, hasGps };
+}
+function scanImageMetadata(bytes) {
+  try {
+    if (bytes[0] === 0xFF && bytes[1] === 0xD8) return jpegMetaInfo(bytes);
+    if (bytes[0] === 0x89 && bytes[1] === 0x50) return pngMetaInfo(bytes);
+    if (bytes[0] === 0x52 && bytes[1] === 0x49) return webpMetaInfo(bytes);
+  } catch { /* malformed input — treat as no findings */ }
+  return null;
+}
+
 /* ============================================================
    §2 protocol (pure) — QRF fountain frames
    Frame:      QRF|<id>|<k>|<len>|<seed>|<b64 xor-block>
@@ -13097,6 +13241,14 @@ const sendChip = $('send-filechip'), generateBtn = $('generate');
 const fpsSlider = $('fps'), fpsOut = $('fps-out'), chunkSel = $('chunk');
 const qrCanvas = $('qr-canvas'), player = $('player'), frameCount = $('framecount');
 const sendStats = $('send-stats'), sendWarn = $('send-warn'), sendOutput = $('send-output');
+const sendMetaWarn = $('send-metawarn');
+const metaDialog = $('metadata-dialog'), metaDialogText = $('metadata-dialog-text'), metaDialogOk = $('metadata-dialog-ok');
+metaDialogOk.addEventListener('click', () => metaDialog.close());
+metaDialog.addEventListener('click', (e) => {
+  const r = metaDialog.getBoundingClientRect();
+  const inside = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+  if (!inside) metaDialog.close();   // click on the backdrop
+});
 const sendHint = $('send-hint'), sendEncoded = $('send-encoded');
 
 let pickedFile = null;
@@ -13124,19 +13276,44 @@ sendFileInput.addEventListener('change', () => {
   if (sendFileInput.files[0]) setFile(sendFileInput.files[0]);
   sendFileInput.value = '';
 });
-function setFile(file) {
+async function setFile(file) {
   pickedFile = file;
   sendChip.innerHTML = '';
+  sendMetaWarn.innerHTML = '';
   const chip = document.createElement('span');
   chip.className = 'filechip';
   chip.append(file.name + ' · ' + fmtBytes(file.size));
   const x = document.createElement('button');
   x.textContent = '✕';
   x.setAttribute('aria-label', 'Remove file');
-  x.addEventListener('click', () => { pickedFile = null; sendChip.innerHTML = ''; updateGenerateState(); });
+  x.addEventListener('click', () => { pickedFile = null; sendChip.innerHTML = ''; sendMetaWarn.innerHTML = ''; updateGenerateState(); });
   chip.append(x);
   sendChip.append(chip);
   updateGenerateState();
+
+  if (/^image\/(jpeg|png|webp)$/.test(file.type)) {
+    try {
+      const info = scanImageMetadata(new Uint8Array(await file.arrayBuffer()));
+      if (info && pickedFile === file) {
+        let level = null, msg = '';
+        if (info.hasGps) {
+          level = 'strong';
+          msg = 'This image has embedded <strong>GPS location data</strong>. It will be sent exactly as-is. ' +
+            'Strip it first — OS share sheet → “Remove Location”, a tool like ExifTool, or your photo app’s ' +
+            'export options — if you don’t want to share where it was taken.';
+        } else if (info.hasExif) {
+          level = '';
+          msg = 'This image has embedded metadata (camera model, timestamp). It will be sent exactly as-is — ' +
+            'strip it first if you don’t want to include it.';
+        }
+        if (level !== null) {
+          sendMetaWarn.innerHTML = '<div class="warn' + (level ? ' ' + level : '') + '">' + msg + '</div>';
+          metaDialogText.innerHTML = msg;
+          if (typeof metaDialog.showModal === 'function') metaDialog.showModal();
+        }
+      }
+    } catch { /* best-effort — never block sending on a failed scan */ }
+  }
 }
 
 function readPayload() {
@@ -13997,6 +14174,58 @@ async function selfTest() {
     for (let c = 0; c < st.k; c++) rx2.ingest(fountainFrameText(st, c), 'upload');
     const ok = /corrupt/i.test(err) && !rx2.done;
     rows.push(['corrupt reassembly rejected', ok, err || 'no error fired']);
+  }
+
+  // metadata scanner — read-only detection used for the pre-send privacy warning
+  {
+    function u8(...parts) {
+      const arrs = parts.map((p) => (p instanceof Uint8Array ? p : new Uint8Array(p)));
+      const out = new Uint8Array(arrs.reduce((n, a) => n + a.length, 0));
+      let o = 0; for (const a of arrs) { out.set(a, o); o += a.length; }
+      return out;
+    }
+    const u16le = (n) => [n & 0xFF, (n >>> 8) & 0xFF];
+    const u32le = (n) => [n & 0xFF, (n >>> 8) & 0xFF, (n >>> 16) & 0xFF, (n >>> 24) & 0xFF];
+    const u16be = (n) => [(n >> 8) & 0xFF, n & 0xFF];
+    const u32be = (n) => [(n >>> 24) & 0xFF, (n >>> 16) & 0xFF, (n >>> 8) & 0xFF, n & 0xFF];
+    const ascii = (s) => Array.from(s).map((c) => c.charCodeAt(0));
+    function tiffWithTag(tag) {
+      return u8([0x49, 0x49, 0x2A, 0x00], u32le(8), u16le(1), u16le(tag), u16le(4), u32le(1), u32le(0), u32le(0));
+    }
+    function jpegWith(app1Body) {
+      const seg = app1Body ? u8([0xFF, 0xE1], u16be(app1Body.length + 2), app1Body) : new Uint8Array(0);
+      return u8([0xFF, 0xD8], seg, [0xFF, 0xD9]);
+    }
+    const exifSeg = (tiff) => u8([0x45, 0x78, 0x69, 0x66, 0, 0], tiff);
+    const pngChunk = (type, data) => u8(u32be(data.length), ascii(type), data, [0, 0, 0, 0]);
+    function pngWith(...chunks) {
+      return u8([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A], pngChunk('IHDR', new Uint8Array(13)),
+        ...chunks, pngChunk('IEND', new Uint8Array(0)));
+    }
+    const webpChunk = (fourcc, data) => u8(ascii(fourcc), u32le(data.length), data, data.length % 2 ? [0] : []);
+    function webpWith(...chunks) {
+      const body = u8(webpChunk('VP8 ', new Uint8Array(4)), ...chunks);
+      return u8(ascii('RIFF'), u32le(4 + body.length), ascii('WEBP'), body);
+    }
+    const xmpGpsText = new TextEncoder().encode('<x:xmpmeta><rdf:Description exif:GPSLatitude="1,2N"/></x:xmpmeta>');
+    const itxtXmpGps = () => u8(ascii('XML:com.adobe.xmp'), [0, 0, 0, 0, 0], xmpGpsText);
+
+    const scanCases = [
+      ['JPEG, no EXIF', jpegWith(null), { hasExif: false, hasGps: false }],
+      ['JPEG, EXIF without GPS', jpegWith(exifSeg(tiffWithTag(0x0110))), { hasExif: true, hasGps: false }],
+      ['JPEG, EXIF with GPS', jpegWith(exifSeg(tiffWithTag(0x8825))), { hasExif: true, hasGps: true }],
+      ['PNG, no metadata', pngWith(), { hasExif: false, hasGps: false }],
+      ['PNG, eXIf with GPS', pngWith(pngChunk('eXIf', tiffWithTag(0x8825))), { hasExif: true, hasGps: true }],
+      ['PNG, XMP mentions GPS', pngWith(pngChunk('iTXt', itxtXmpGps())), { hasExif: true, hasGps: true }],
+      ['WebP, EXIF with GPS', webpWith(webpChunk('EXIF', tiffWithTag(0x8825))), { hasExif: true, hasGps: true }],
+    ];
+    for (const [name, bytes, want] of scanCases) {
+      const got = scanImageMetadata(bytes);
+      const ok = !!got && got.hasExif === want.hasExif && got.hasGps === want.hasGps;
+      rows.push(['metadata scan: ' + name, ok, ok ? 'hasExif=' + got.hasExif + ' hasGps=' + got.hasGps : JSON.stringify(got)]);
+    }
+    const nonImage = scanImageMetadata(new TextEncoder().encode('hello, not an image'));
+    rows.push(['metadata scan: non-image bytes → null', nonImage === null, String(nonImage)]);
   }
 
   const allPass = rows.every((r) => r[1]);

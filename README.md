@@ -75,6 +75,11 @@ it.
 **Are filenames kept?** No — just the bytes and the MIME type. Downloads come out as
 `qr-transfer-<id>.<ext>`.
 
+**What about EXIF/GPS data in photos?** The file's bytes are sent exactly as-is, so any
+EXIF, XMP, or GPS metadata embedded in a JPEG/PNG/WebP travels through untouched — the
+app doesn't strip it. Picking such a file on the Send tab shows a warning (stronger if
+it specifically finds a GPS tag) so you can strip it yourself first if that matters.
+
 **The camera won't start?** It needs permission and a secure page (HTTPS or localhost).
 If it stays dead, drop QR images into the Receive tab instead; screenshots decode
 better than photos anyway.
