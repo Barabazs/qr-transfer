@@ -393,7 +393,7 @@ footer a { color: var(--ink); text-underline-offset: 2px; }
     <label class="small" for="result-encoded">Encoded data</label>
     <textarea id="result-encoded" readonly spellcheck="false"></textarea>
     <div class="actions">
-      <button class="btn mini" id="copy-result" aria-live="polite">Copy</button>
+      <button class="btn mini" id="copy-result" title="Copy decoded text" aria-live="polite" hidden>Copy</button>
       <button class="btn mini ghost" id="download" hidden>Download</button>
     </div>
     <div class="preview" id="preview"></div>
@@ -13681,7 +13681,9 @@ async function ingestFiles(fileList) {
 const stripWrap = $('rx-strip'), stripCanvas = $('strip-canvas'), progressLabel = $('rx-progress-label');
 const result = $('result'), resultMeta = $('result-meta'), resultEncoded = $('result-encoded');
 const preview = $('preview'), downloadBtn = $('download');
+const copyResultBtn = $('copy-result');
 let downloadUrl = null;
+let resultDecodedText = null;
 
 function drawStrip(have) {
   const n = have.length;
@@ -13745,6 +13747,8 @@ function showResult(payload, id, seconds) {
   preview.innerHTML = '';
   if (downloadUrl) { URL.revokeObjectURL(downloadUrl); downloadUrl = null; }
   downloadBtn.hidden = true;
+  resultDecodedText = null;
+  copyResultBtn.hidden = true;
 
   const p = parsePayload(payload);
   if (p.kind === 'opaque') {
@@ -13774,6 +13778,8 @@ function showResult(payload, id, seconds) {
     const pre = document.createElement('pre');
     pre.textContent = text;
     preview.append(pre);
+    resultDecodedText = text;
+    copyResultBtn.hidden = false;
     if (mime) showDownload(mime, id);
   } else {
     showDownload(mime || 'application/octet-stream', id);
@@ -13790,7 +13796,21 @@ function showDownload(mime, id) {
   };
 }
 
-$('copy-result').addEventListener('click', () => copyText(resultEncoded, $('copy-result')));
+copyResultBtn.addEventListener('click', () => {
+  if (!resultDecodedText) return;
+  const done = () => {
+    const old = copyResultBtn.textContent;
+    copyResultBtn.textContent = 'Copied';
+    setTimeout(() => { copyResultBtn.textContent = old; }, 1200);
+  };
+  navigator.clipboard?.writeText(resultDecodedText).then(done).catch(() => {
+    const range = document.createRange();
+    range.selectNodeContents(preview);
+    const sel = getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  });
+});
 $('reset').addEventListener('click', () => {
   reasm.reset();
   result.hidden = true;
