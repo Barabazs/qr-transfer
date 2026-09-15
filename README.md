@@ -5,8 +5,8 @@ the other device's camera reads them — no network, no server. Built to be host
 Ethereum Swarm.
 
 - **Send**: text becomes plain base64; any file becomes a `data:<mime>;base64,...` URI.
-  Payloads that fit in one QR (≤ 2,331 bytes, EC level M) are emitted as a plain QR any
-  scanner app can read. Bigger payloads stream as **fountain-coded** frames
+  Payloads that fit in one QR (≤ 2,331 bytes, EC level M) are emitted as a single QR
+  code. Bigger payloads stream as **fountain-coded** frames
   (`QRF|<transferId>|<k>|<len>|<seed>|<b64 xor-block>`, EC level L, fixed QR version per
   transfer): first a systematic pass (each of the `k` chunks once, in order — a clean
   first pass completes immediately), then an endless deterministic stream of repair
@@ -59,9 +59,8 @@ stream in up to 9,999 chunks: roughly 1.9, 4.77 or 7.6 MB encoded at 200, 500 or
 warning. Small transfers stay pleasant; multi-hundred-KB ones mean minutes of holding
 the phone still.
 
-**Can a normal scanner app read the codes?** The small single-code payloads, yes.
-Streamed QRF frames mean nothing to other scanners — the receiving end has to be this
-page.
+**Can a normal scanner app read the codes?** No — even the single-code payloads are
+encoded (base64, or a data URI for files). Use this app to read them.
 
 **What if the receiver misses frames?** Nothing to do. Repair frames keep coming and
 any one of them can fill any gap, so a dropped frame costs seconds, not another lap

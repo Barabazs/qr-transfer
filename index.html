@@ -430,8 +430,8 @@ footer a { color: var(--ink); text-underline-offset: 2px; }
   </details>
   <details>
     <summary>Can a normal scanner app read these codes?</summary>
-    <p>The small single-code payloads, yes. Streamed <code>QRF</code> frames mean nothing
-    to other scanners — the receiving end has to be this page.</p>
+    <p>No — even the single-code payloads are encoded (base64, or a data URI for files).
+    Use this app to read them.</p>
   </details>
   <details>
     <summary>What if the receiver misses frames?</summary>
@@ -471,7 +471,7 @@ footer a { color: var(--ink); text-underline-offset: 2px; }
 </section>
 
 <footer>
-  Payloads that fit in one QR code are plain — any scanner app can read them. Bigger payloads stream
+  Payloads that fit in one QR code are plain. Bigger payloads stream
   as <span style="font-family:var(--mono)">QRF</span> fountain frames: after a first pass through the
   chunks, endless XOR repair frames follow, and <em>any</em> of them can patch what the receiver is
   missing — a missed frame never costs another full loop. Nothing leaves your device.
@@ -13376,7 +13376,7 @@ generateBtn.addEventListener('click', async () => {
       blitFrame(renderFrame(payload, 0, 'M', 4));
       frameCount.textContent = '';
       player.hidden = true;
-      sendHint.textContent = 'Single code — any QR scanner app can read it.';
+      sendHint.textContent = '';
     } else {
       const chunkSize = Number(chunkSel.value);
       const k = Math.ceil(payload.length / chunkSize);
