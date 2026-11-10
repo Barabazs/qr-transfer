@@ -324,7 +324,7 @@ footer a { color: var(--ink); text-underline-offset: 2px; }
   <textarea id="send-text" placeholder="Paste or type text to send…" spellcheck="false"></textarea>
 
   <div class="drop" id="send-drop" tabindex="0" role="button" aria-label="Choose a file to send">
-    Drop, paste, or click to choose a file — it will be sent as a base64 data URI
+    Drop, paste, or click to choose a file — its name and type travel with it, checked by a CRC-32 on arrival
   </div>
   <input type="file" id="send-file" hidden>
   <div id="send-filechip"></div>
@@ -422,7 +422,7 @@ footer a { color: var(--ink); text-underline-offset: 2px; }
   </details>
   <details>
     <summary>How much can I send?</summary>
-    <p>One QR code holds up to 2,331 bytes. Past that, payloads stream in up to 9,999
+    <p>One QR code holds up to 2,331 encoded bytes (about 1.7&nbsp;KB of file). Past that, payloads stream in up to 9,999
     chunks: roughly 1.9, 4.77 or 7.6&nbsp;MB encoded at 200, 500 or 800-byte frames.
     Base64 adds a third on top, so a 75&nbsp;KB file already trips the 100&nbsp;KB
     warning. Small transfers stay pleasant; multi-hundred-KB ones mean minutes of holding
@@ -430,8 +430,8 @@ footer a { color: var(--ink); text-underline-offset: 2px; }
   </details>
   <details>
     <summary>Can a normal scanner app read these codes?</summary>
-    <p>The small single-code payloads, yes. Streamed <code>QRG</code> frames mean nothing
-    to other scanners — the receiving end has to be this page.</p>
+    <p>No. Every code, even a single one, is a <code>QRC|</code> frame carrying a base64
+    container. Use this app to read them.</p>
   </details>
   <details>
     <summary>What if the receiver misses frames?</summary>
@@ -440,14 +440,15 @@ footer a { color: var(--ink); text-underline-offset: 2px; }
   </details>
   <details>
     <summary>Is the transfer verified?</summary>
-    <p>Partly. Each frame carries QR error correction and the result has to parse cleanly,
-    but that is not a checksum. Compare anything important against the original before
-    deleting it.</p>
+    <p>Yes, against accidental damage. The file travels in a container with a CRC-32 over
+    its name, type, size and bytes. The receiver checks it before offering the result, and
+    a mismatch restarts the transfer. CRC-32 catches misreads, not deliberate tampering: it
+    is not a cryptographic hash.</p>
   </details>
   <details>
     <summary>Are filenames kept?</summary>
-    <p>No — just the bytes and the MIME type. Downloads come out as
-    <code>qr-transfer-&lt;id&gt;.&lt;ext&gt;</code>.</p>
+    <p>Yes. The filename and MIME type travel inside the checksummed container, and
+    Download uses the original name. Typed text has no name.</p>
   </details>
   <details>
     <summary>The camera won't start?</summary>
@@ -471,12 +472,12 @@ footer a { color: var(--ink); text-underline-offset: 2px; }
 </section>
 
 <footer>
-  Payloads that fit in one QR code are plain — any scanner app can read them. Bigger payloads stream
-  as <span style="font-family:var(--mono)">QRG</span> fountain frames: after a first pass through the
+  Every code is a <span style="font-family:var(--mono)">QRC</span> frame; bigger payloads stream
+  as <span style="font-family:var(--mono)">QRC</span> fountain frames: after a first pass through the
   chunks, endless XOR repair frames follow, and <em>any</em> of them can patch what the receiver is
   missing — a missed frame never costs another full loop. Nothing leaves your device.
-  And nothing is guaranteed: there is no end-to-end checksum, so check important
-  transfers against the original before trusting the copy.
+  A CRC-32 checks every finished transfer against accidental damage; still keep the original
+  of anything important until you've checked the copy.
   <p class="byline">Prompted by <a href="https://x.com/barabazs_" target="_blank" rel="noopener">@barabazs_</a> · executed by Claude</p>
 </footer>
 

@@ -4,10 +4,11 @@ File transfer by light: a single self-contained HTML page. One screen blinks QR 
 the other device's camera reads them — no network, no server. Built to be hosted on
 Ethereum Swarm.
 
-- **Send**: text becomes plain base64; any file becomes a `data:<mime>;base64,...` URI.
-  Payloads that fit in one QR (≤ 2,331 bytes, EC level M) are emitted as a plain QR any
-  scanner app can read. Bigger payloads stream as **fountain-coded** frames
-  (`QRG|<transferId>|<k>|<len>|<seed>|<b64 xor-block>`, EC level L, fixed QR version per
+- **Send**: text or a file is wrapped in a small container (magic, filename, MIME type,
+  size, and a CRC-32 over all of it) and base64-encoded. A payload that fits in one QR
+  (≤ 2,331 characters including its `QRC|` tag, EC level M) goes out as a single
+  `QRC|<base64 container>` code. Bigger payloads stream as **fountain-coded** frames
+  (`QRC|<transferId>|<k>|<len>|<seed>|<b64 xor-block>`, EC level L, fixed QR version per
   transfer): first a systematic pass (each of the `k` chunks once, in order — a clean
   first pass completes immediately), then an endless deterministic stream of repair
   frames, each the XOR of a pseudo-random half of all chunks (seed in the
@@ -18,10 +19,11 @@ Ethereum Swarm.
   up to ~40 Hz) with the native `BarcodeDetector` API where available (Android Chrome)
   and jsQR everywhere else — or dropped/uploaded QR images, fed through a GF(2)
   elimination decoder: a receiver missing m chunks needs about m + 2 repair frames,
-  whichever ones it catches. Output is the encoded string verbatim, plus a
-  decode panel (image preview / text / download). Filenames are not carried — downloads
-  get a name like `qr-transfer-<id>.<ext>`, with the extension guessed from the MIME
-  type.
+  whichever ones it catches. Output is the encoded string (the base64 container) verbatim, plus a
+  decode panel (image preview / text / download). Before showing anything, the receiver
+  checks the container's CRC-32; a mismatch is reported as corrupt and the transfer starts
+  over. Downloads keep the sender's filename (path characters replaced); only a nameless
+  payload falls back to `qr-transfer-<id>.<ext>`.
 
 ## Usage
 
@@ -36,10 +38,11 @@ shown ≈ one pass ÷ the fraction the camera catches, plus about 2: one pass + 
 5 % frame loss, + ~25 % at 20 %, + ~68 % at 40 %, regardless of *which* frames were
 dropped. The page warns above 100 KB encoded (base64 is ≈ ⅓ larger than the source
 file), and again above 500 KB. Transfers are hard-capped at 9,999 chunks — the frame
-format's limit (≈ 4.77 MB encoded at the default 500 B frame size). Older
-frame formats are gone (hard cutovers): sequential `QRX` frames and soliton-coded `QRF`
-frames, including previously exported frame PNGs, are ignored by the receiver. Sender
-and receiver must both run this version.
+format's limit (≈ 4.77 MB encoded at the default 500 B frame size). Frame
+formats are hard cutovers. Earlier codes are no longer read: sequential `QRX` frames,
+`QRF` and `QRG` fountain frames (including previously exported frame PNGs) and
+pre-container single codes (bare base64 or data URI). Older copies of this page likewise
+ignore the new `QRC` codes. Sender and receiver must both run this version.
 
 Self-test (full in-memory optical round trip, no camera needed):
 
@@ -56,27 +59,26 @@ straight into the Receive tab — a camera-free end-to-end check.
 every network request, and nothing is written to disk. Reload the page and it's all
 gone.
 
-**How much can I send?** One QR code holds up to 2,331 bytes. Past that, payloads
+**How much can I send?** One QR code holds up to 2,331 encoded bytes (about 1.7 KB of file). Past that, payloads
 stream in up to 9,999 chunks: roughly 1.9, 4.77 or 7.6 MB encoded at 200, 500 or
 800-byte frames. Base64 adds a third on top, so a 75 KB file already trips the 100 KB
 warning. Small transfers stay pleasant; multi-hundred-KB ones mean minutes of holding
 the phone still.
 
-**Can a normal scanner app read the codes?** The small single-code payloads, yes.
-Streamed QRG frames mean nothing to other scanners — the receiving end has to be this
-page.
+**Can a normal scanner app read the codes?** No. Every code, even a single one, is a
+`QRC|` frame carrying a base64 container. Use this app to read them.
 
 **What if the receiver misses frames?** Nothing to do. Repair frames keep coming and
 any one of them can fill any gap, so a dropped frame costs seconds, not another lap
 through the whole sequence.
 
-**Is the transfer verified?** Partly. Each frame carries QR error correction and the
-result has to parse cleanly (strict UTF-8, valid base64). That catches most damage, but
-it is not a checksum. Compare anything important against the original before deleting
-it.
+**Is the transfer verified?** Yes, against accidental damage. The file travels in a
+container with a CRC-32 over its name, type, size and bytes. The receiver checks it
+before offering the result, and a mismatch restarts the transfer. CRC-32 catches
+misreads, not deliberate tampering: it is not a cryptographic hash.
 
-**Are filenames kept?** No — just the bytes and the MIME type. Downloads come out as
-`qr-transfer-<id>.<ext>`.
+**Are filenames kept?** Yes. The filename and MIME type travel inside the checksummed
+container, and Download uses the original name. Typed text has no name.
 
 **What about EXIF/GPS data in photos?** The file's bytes are sent exactly as-is, so any
 EXIF, XMP, or GPS metadata embedded in a JPEG/PNG/WebP travels through untouched — the
@@ -126,7 +128,7 @@ update the banners, table, and hashes.
 
 ## Disclaimer
 
-Use at your own risk, with no warranty of any kind. Nothing guards a finished transfer
-beyond QR error correction and a clean parse, so whether the copy is good is for you to
-decide: keep the original until you've checked. Nothing is stored, either. A reload or
+Use at your own risk, with no warranty of any kind. A CRC-32 guards each finished transfer
+against accidental corruption, not tampering, so keep the original until you've checked
+anything that matters. Nothing is stored, either. A reload or
 reset throws away all progress and received data.
