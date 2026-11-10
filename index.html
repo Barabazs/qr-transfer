@@ -12942,6 +12942,22 @@ function mulberry32Int(a) {
     return (t ^ (t >>> 14)) >>> 0;
   };
 }
+// CRC-32 (IEEE 802.3 / zlib / PNG: reflected poly 0xEDB88320, init and final xor 0xFFFFFFFF)
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let j = 0; j < 8; j++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
 // 4 bytes at a time when both views are word-aligned (all chunk buffers here are);
 // the fountain decoder spends most of its time in this loop
 function xorInto(dst, src) {
@@ -13090,16 +13106,84 @@ function scanImageMetadata(bytes) {
 }
 
 /* ============================================================
-   §2 protocol (pure) — QRG fountain frames
-   Frame:      QRG|<id>|<k>|<len>|<seed>|<b64 xor-block>
+   §2 protocol (pure) — container + QRC frames
+   Payload:    base64 of a container (see encodeContainer) holding the
+               file bytes, its name, MIME type, size and a CRC-32.
+   Single:     QRC|<payload>                  (fits one code, EC level M)
+   Fountain:   QRC|<id>|<k>|<len>|<seed>|<b64 xor-block>
    seed "s<n>" = systematic frame carrying chunk n alone;
    numeric seed drives the PRNG that picks the dense XORed chunk set
    (each chunk with probability ½ — denseRowFromSeed).
-   Dead formats, ignored on receive: QRX| (v1 sequential), QRF| (v2 soliton).
-   Payload ≤ SINGLE_MAX is emitted headerless (stock-scanner readable).
+   Older tags (QRX, QRF, QRG) are dead formats: parsed as 'invalid', never ingested.
    ============================================================ */
 
-const FRAME_PREFIX = 'QRG|';
+const FRAME_TAG = 'QRC';
+const LEGACY_TAGS = ['QRX', 'QRF', 'QRG'];
+
+// Container v1 (all integers big-endian):
+//   0  4  magic "QTC" + version 0x01
+//   4  1  flags — none defined in v1, must be 0
+//   5  4  body size in bytes
+//   9  1  MIME length m (ASCII; '' = typed text from the Send textarea)
+//  10  1  filename length n (UTF-8 bytes; '' = no name)
+//  11  m  MIME, then n filename bytes, then the body
+// end-4 4 CRC-32 of every byte before it (header and body)
+const CONTAINER_MAGIC = [0x51, 0x54, 0x43, 0x01];
+const CONTAINER_FIXED = 15;   // 11 header bytes + 4 CRC bytes
+const MIME_RE = /^[\x20-\x7e]*$/;
+function utf8Capped(str, maxBytes) {
+  const enc = new TextEncoder();
+  let chars = Array.from(str), b = enc.encode(str);
+  while (b.length > maxBytes) { chars.pop(); b = enc.encode(chars.join('')); }
+  return b;
+}
+function encodeContainer({ bytes, mime, name }) {
+  const enc = new TextEncoder();
+  const m = enc.encode(mime.length <= 255 && MIME_RE.test(mime) ? mime : 'application/octet-stream');
+  const n = utf8Capped(name, 255);
+  const out = new Uint8Array(CONTAINER_FIXED + m.length + n.length + bytes.length);
+  const dv = new DataView(out.buffer);
+  out.set(CONTAINER_MAGIC, 0);
+  out[4] = 0;
+  dv.setUint32(5, bytes.length, false);
+  out[9] = m.length;
+  out[10] = n.length;
+  out.set(m, 11);
+  out.set(n, 11 + m.length);
+  out.set(bytes, 11 + m.length + n.length);
+  dv.setUint32(out.length - 4, crc32(out.subarray(0, out.length - 4)), false);
+  return out;
+}
+// -> {name, mime, bytes} or null when the magic, CRC, flags, sizes or strings don't check out
+function decodeContainer(c) {
+  if (c.length < CONTAINER_FIXED) return null;
+  for (let i = 0; i < 4; i++) if (c[i] !== CONTAINER_MAGIC[i]) return null;
+  const dv = new DataView(c.buffer, c.byteOffset, c.byteLength);
+  if (dv.getUint32(c.length - 4, false) !== crc32(c.subarray(0, c.length - 4))) return null;
+  if (c[4] !== 0) return null;
+  const size = dv.getUint32(5, false), ml = c[9], nl = c[10];
+  if (CONTAINER_FIXED + ml + nl + size !== c.length) return null;
+  let mime, name;
+  try {
+    const td = new TextDecoder('utf-8', { fatal: true });
+    mime = td.decode(c.subarray(11, 11 + ml));
+    name = td.decode(c.subarray(11 + ml, 11 + ml + nl));
+  } catch { return null; }
+  if (!MIME_RE.test(mime)) return null;
+  const start = 11 + ml + nl;
+  return { name, mime, bytes: c.slice(start, start + size) };
+}
+// transfer string (base64 container) -> {name, mime, bytes} or null
+function payloadToFile(payload) {
+  if (!B64_RE.test(payload)) return null;
+  let bytes;
+  try { bytes = base64ToBytes(payload); } catch { return null; }
+  return decodeContainer(bytes);
+}
+function singleFrameText(payload) {
+  return FRAME_TAG + '|' + payload;
+}
+
 
 // dense repair row for a numeric seed: bit i (word i >>> 5, bit i & 31) set = chunk i
 // is XORed in. Every chunk joins with probability ½, so any m still-missing chunks are
@@ -13151,12 +13235,13 @@ function fountainFrameText(st, c) {
     for (let i = 0; i < st.k; i++) if (rowHas(row, i)) xorInto(block, st.chunks[i]);
     seedStr = String(seed);
   }
-  return FRAME_PREFIX + st.id + '|' + st.k + '|' + st.len + '|' + seedStr + '|' + bytesToBase64(block);
+  return FRAME_TAG + '|' + st.id + '|' + st.k + '|' + st.len + '|' + seedStr + '|' + bytesToBase64(block);
 }
 
 function parseFrame(str) {
-  if (str.startsWith(FRAME_PREFIX)) {
+  if (str.startsWith(FRAME_TAG + '|')) {
     const p = str.split('|');
+    if (p.length === 2 && p[1].length > 0 && B64_RE.test(p[1])) return { kind: 'single', body: p[1] };
     if (p.length === 6 && /^[0-9a-f]{8}$/.test(p[1]) && /^[1-9]\d{0,3}$/.test(p[2]) &&
         /^[1-9]\d{0,7}$/.test(p[3]) && /^(s\d{1,4}|\d{1,10})$/.test(p[4]) &&
         p[5].length > 0 && B64_RE.test(p[5])) {
@@ -13164,19 +13249,9 @@ function parseFrame(str) {
     }
     return { kind: 'invalid' };
   }
-  if (str.startsWith('QRX|') || str.startsWith('QRF|')) return { kind: 'invalid' };   // dead v1/v2 formats
-  return { kind: 'complete', body: str.trim() };
+  if (LEGACY_TAGS.some((t) => str.startsWith(t + '|'))) return { kind: 'invalid' };   // pre-cutover frames
+  return { kind: 'foreign' };   // a stray QR, or a pre-cutover bare base64 / data-URI single code
 }
-function validatePayload(payload) {
-  if (payload.startsWith('data:')) {
-    const m = /^data:[^,]*;base64,([A-Za-z0-9+/=]*)$/.exec(payload);
-    if (!m) return false;
-    try { atob(m[1]); return true; } catch { return false; }
-  }
-  if (!B64_RE.test(payload)) return false;
-  try { atob(payload); return true; } catch { return false; }
-}
-
 /* ============================================================
    §3 qrRender
    ============================================================ */
@@ -13210,7 +13285,7 @@ function renderFrame(text, typeNumber, ecLevel, cellSize) {
 }
 // fixed QR version for a whole transfer, sized for the worst-case frame
 function transferTypeNumber(st) {
-  const worst = FRAME_PREFIX + st.id + '|' + st.k + '|' + st.len + '|4294967295|' +
+  const worst = FRAME_TAG + '|' + st.id + '|' + st.k + '|' + st.len + '|4294967295|' +
     'A'.repeat(4 * Math.ceil(st.s / 3));
   return fitTypeNumber(worst, 'L');
 }
@@ -13316,17 +13391,13 @@ document.addEventListener('paste', (e) => {
   }
 });
 
-function readPayload() {
+// what gets sent: a picked file with its name and type, or the textarea as UTF-8 (mime '' marks typed text)
+async function readSendFile() {
   if (pickedFile) {
-    const blob = pickedFile.type ? pickedFile : new Blob([pickedFile], { type: 'application/octet-stream' });
-    return new Promise((resolve, reject) => {
-      const r = new FileReader();
-      r.onload = () => resolve(r.result);
-      r.onerror = () => reject(r.error);
-      r.readAsDataURL(blob);
-    });
+    return { bytes: new Uint8Array(await pickedFile.arrayBuffer()),
+             mime: pickedFile.type || 'application/octet-stream', name: pickedFile.name || '' };
   }
-  return Promise.resolve(bytesToBase64(new TextEncoder().encode(sendText.value)));
+  return { bytes: new TextEncoder().encode(sendText.value), mime: '', name: '' };
 }
 
 fpsSlider.addEventListener('input', () => {
@@ -13339,8 +13410,9 @@ generateBtn.addEventListener('click', async () => {
   generateBtn.disabled = true;
   sendStats.textContent = 'Encoding…';
   try {
-    const payload = await readPayload();
-    if (!payload) { sendStats.textContent = 'Nothing to send.'; return; }
+    const file = await readSendFile();
+    if (!pickedFile && file.bytes.length === 0) { sendStats.textContent = 'Nothing to send.'; return; }
+    const payload = bytesToBase64(encodeContainer(file));
     sendWarn.innerHTML = '';
     if (payload.length > 500000) {
       sendWarn.innerHTML = '<div class="warn strong">Very large transfer (' + fmtBytes(payload.length) +
@@ -13351,9 +13423,9 @@ generateBtn.addEventListener('click', async () => {
     }
     sendOutput.hidden = false;
     sendEncoded.value = payload;
-    if (payload.length <= SINGLE_MAX) {
+    if (singleFrameText(payload).length <= SINGLE_MAX) {
       anim = { mode: 'single', payload, exportOffset: 0 };
-      blitFrame(renderFrame(payload, 0, 'M', 4));
+      blitFrame(renderFrame(singleFrameText(payload), 0, 'M', 4));
       frameCount.textContent = '';
       player.hidden = true;
       sendHint.textContent = 'Single code — any QR scanner app can read it.';
@@ -13480,7 +13552,7 @@ $('export').addEventListener('click', async () => {
   const end = Math.min(start + BATCH, total);
   for (let i = start; i < end; i++) {
     const canvas = anim.mode === 'single'
-      ? renderFrame(anim.payload, 0, 'M', 4)
+      ? renderFrame(singleFrameText(anim.payload), 0, 'M', 4)
       : renderFrame(fountainFrameText(anim.st, i), anim.typeNumber, 'L', 4);
     const blob = await new Promise((r) => canvas.toBlob(r, 'image/png'));
     if (!blob) {
@@ -13632,15 +13704,16 @@ class TransferReceiver {
     if (this.done || typeof str !== 'string' || str.length === 0) return;
     const f = parseFrame(str);
     if (f.kind === 'invalid') return;
-    if (f.kind === 'complete') {
+    if (f.kind === 'single' || f.kind === 'foreign') {
       // stray-QR guard: a random background QR must not hijack a camera session
-      if (!validatePayload(f.body)) {
+      const file = f.kind === 'single' ? payloadToFile(f.body) : null;
+      if (!file) {
         if (source === 'upload') this.onError('That QR is not a transfer from this tool.');
         return;
       }
       if (source === 'camera' && this.hasActiveTransfer()) return;
       this.done = true;
-      this.onComplete({ payload: f.body, id: null, seconds: null });
+      this.onComplete({ payload: f.body, file, id: null, seconds: null });
       return;
     }
     let block;
@@ -13668,16 +13741,17 @@ class TransferReceiver {
       have: t.dec.chunks.map(Boolean), framesSeen: t.framesSeen,
     });
     if (t.dec.decoded === t.dec.k) {
-      let payload;
+      let payload = null, file = null;
       try { payload = new TextDecoder('utf-8', { fatal: true }).decode(t.dec.payloadBytes()); }
       catch { payload = null; }
-      if (payload === null || !validatePayload(payload)) {
-        this.onError('The reassembled data is corrupt — reset and scan again.');
+      if (payload !== null) file = payloadToFile(payload);
+      if (!file) {
+        this.onError('The reassembled data is corrupt (checksum mismatch) — reset and scan again.');
         this.transfers.delete(f.id);
         return;
       }
       this.done = true;
-      this.onComplete({ payload, id: f.id, seconds: (performance.now() - t.startedAt) / 1000 });
+      this.onComplete({ payload, file, id: f.id, seconds: (performance.now() - t.startedAt) / 1000 });
     }
   }
 }
@@ -13908,14 +13982,9 @@ const MIME_EXT = {
   'text/csv': 'csv', 'application/octet-stream': 'bin',
 };
 
-function parsePayload(payload) {
-  if (payload.startsWith('data:')) {
-    const m = /^data:([^;,]*);base64,([A-Za-z0-9+/=]*)$/.exec(payload);
-    if (m) return { kind: 'datauri', mime: m[1] || 'application/octet-stream', bytes: base64ToBytes(m[2]) };
-    return { kind: 'opaque' };
-  }
-  try { return { kind: 'base64', mime: null, bytes: base64ToBytes(payload) }; }
-  catch { return { kind: 'opaque' }; }
+// received filename -> safe download name: no path separators or control characters, no leading dots
+function safeFileName(name) {
+  return name.replace(/[\u0000-\u001f\u007f/\\]/g, '_').replace(/^[.\s]+/, '').trim().slice(0, 200);
 }
 
 const reasm = new TransferReceiver({
@@ -13929,17 +13998,17 @@ const reasm = new TransferReceiver({
     drawStrip(have);
     setStatus(decoded === k ? 'All chunks decoded.' : 'Receiving… every new frame helps, none needs to be caught twice.');
   },
-  onComplete({ payload, id, seconds }) {
+  onComplete({ payload, file, id, seconds }) {
     if ($('autostop').checked) stopCamera();
     setStatus('Transfer complete.');
-    showResult(payload, id, seconds);
+    showResult(payload, file, id, seconds);
   },
   onError(msg) {
     setStatus(msg, true);
   },
 });
 
-function showResult(payload, id, seconds) {
+function showResult(payload, file, id, seconds) {
   const took = seconds == null ? '' :
     ' · took ' + (seconds < 10 ? seconds.toFixed(1) + ' s' : fmtSecs(seconds));
   result.hidden = false;
@@ -13950,48 +14019,44 @@ function showResult(payload, id, seconds) {
   resultDecodedText = null;
   copyResultBtn.hidden = true;
 
-  const p = parsePayload(payload);
-  if (p.kind === 'opaque') {
-    resultMeta.textContent = fmtBytes(payload.length) + ' — not recognizable base64; shown as-is.';
-    return;
-  }
-  const mime = p.mime;
-  resultMeta.textContent = (mime ? mime + ' · ' : 'base64 text · ') +
-    fmtBytes(p.bytes.length) + ' decoded · ' + fmtBytes(payload.length) + ' encoded' +
+  const mime = file.mime;   // '' = typed text from the sender's textarea
+  resultMeta.textContent = (file.name ? file.name + ' · ' : '') + (mime ? mime + ' · ' : 'text · ') +
+    fmtBytes(file.bytes.length) + ' decoded · ' + fmtBytes(payload.length) + ' encoded · CRC-32 verified' +
     (id ? ' · transfer ' + id : '') + took;
 
-  const blob = new Blob([p.bytes], { type: mime || 'application/octet-stream' });
+  const blob = new Blob([file.bytes], { type: mime || 'application/octet-stream' });
   downloadUrl = URL.createObjectURL(blob);
 
   let text = null;
   if (!mime || mime.startsWith('text/') || mime === 'application/json') {
-    try { text = new TextDecoder('utf-8', { fatal: true }).decode(p.bytes); } catch { text = null; }
+    try { text = new TextDecoder('utf-8', { fatal: true }).decode(file.bytes); } catch { text = null; }
   }
 
-  if (mime && mime.startsWith('image/')) {
+  if (mime.startsWith('image/')) {
     const img = document.createElement('img');
     img.src = downloadUrl;
     img.alt = 'Received image';
     preview.append(img);
-    showDownload(mime, id);
+    showDownload(mime, file.name, id);
   } else if (text !== null) {
     const pre = document.createElement('pre');
     pre.textContent = text;
     preview.append(pre);
     resultDecodedText = text;
     copyResultBtn.hidden = false;
-    if (mime) showDownload(mime, id);
+    if (mime) showDownload(mime, file.name, id);
   } else {
-    showDownload(mime || 'application/octet-stream', id);
+    showDownload(mime || 'application/octet-stream', file.name, id);
   }
 }
-function showDownload(mime, id) {
+function showDownload(mime, name, id) {
   const ext = MIME_EXT[mime] || 'bin';
+  const fileName = safeFileName(name) || 'qr-transfer-' + (id || 'data') + '.' + ext;
   downloadBtn.hidden = false;
   downloadBtn.onclick = () => {
     const a = document.createElement('a');
     a.href = downloadUrl;
-    a.download = 'qr-transfer-' + (id || 'data') + '.' + ext;
+    a.download = fileName;
     a.click();
   };
 }
@@ -14103,31 +14168,54 @@ async function selfTest() {
     if (!code) throw new Error('jsQR failed to decode a rendered frame');
     return code.data;
   }
-  const cases = [
-    ['short ASCII text (single QR)', bytesToBase64(new TextEncoder().encode('hello, QR transfer'))],
-    ['unicode text (single QR)', bytesToBase64(new TextEncoder().encode('héllo 👋 — ünïcode ✓'))],
-    ['single-QR boundary (len == SINGLE_MAX)', 'A'.repeat(SINGLE_MAX)],
-    ['fountain: just above single', 'A'.repeat(SINGLE_MAX + 4)],
-    ['fountain: 5 KB data URI', 'data:application/octet-stream;base64,' + bytesToBase64(randomBytes(5 * 1024))],
-    ['fountain: 60 KB data URI', 'data:application/octet-stream;base64,' + bytesToBase64(randomBytes(60 * 1024))],
-    ['fountain: exact chunk multiple', 'B'.repeat(CHUNK * 6)],
-    ['fountain: chunk multiple + 4', 'B'.repeat(CHUNK * 6 + 4)],
+  function fountainRun(rx, st) {
+    for (let c = 0; c < st.k; c++) rx.ingest(fountainFrameText(st, c), 'upload');
+  }
+  function sameFile(got, want) {
+    return !!got && got.name === want.name && got.mime === want.mime &&
+      got.bytes.length === want.bytes.length && got.bytes.every((b, i) => b === want.bytes[i]);
+  }
+  const textFile = (str) => ({ bytes: new TextEncoder().encode(str), mime: '', name: '' });
+  // typed-text file whose transfer string is exactly `len` chars (len a multiple of 4)
+  function fileForPayloadLen(len) {
+    for (let n = 0; ; n++) {
+      const f = { bytes: new Uint8Array(n).fill(0x42), mime: '', name: '' };
+      const got = bytesToBase64(encodeContainer(f)).length;
+      if (got === len) return f;
+      if (got > len) throw new Error('no body size gives a ' + len + '-char payload');
+    }
+  }
+  const maxSinglePayload = SINGLE_MAX - singleFrameText('').length;
+  const lastSingle = maxSinglePayload - (maxSinglePayload % 4);   // base64 lengths are multiples of 4
+  const cases = [   // [name, file, sent as a single code?]
+    ['short ASCII text (single QR)', textFile('hello, QR transfer'), true],
+    ['unicode text (single QR)', textFile('héllo 👋 — ünïcode ✓'), true],
+    ['single-QR boundary (largest single code)', fileForPayloadLen(lastSingle), true],
+    ['fountain: just above single', fileForPayloadLen(lastSingle + 4), false],
+    ['fountain: 5 KB file', { bytes: randomBytes(5 * 1024), mime: 'application/octet-stream', name: 'five.bin' }, false],
+    ['fountain: 60 KB file', { bytes: randomBytes(60 * 1024), mime: 'application/octet-stream', name: 'sixty.bin' }, false],
+    ['fountain: exact chunk multiple', fileForPayloadLen(CHUNK * 6), false],
+    ['fountain: chunk multiple + 4', fileForPayloadLen(CHUNK * 6 + 4), false],
   ];
 
-  for (const [name, payload] of cases) {
+  for (const [name, file, wantSingle] of cases) {
     const t0 = performance.now();
     let ok = false, detail = '';
     try {
+      const payload = bytesToBase64(encodeContainer(file));
+      const isSingle = singleFrameText(payload).length <= SINGLE_MAX;
+      if (isSingle !== wantSingle) throw new Error('sent as ' + (isSingle ? 'single code' : 'fountain') + ', case expects the other');
       let out = null, err = '';
       const rx = new TransferReceiver({
-        onComplete: (res) => { out = res.payload; },
+        onComplete: (res) => { out = res; },
         onError: (e) => { err = e; },
       });
+      const delivered = () => !!out && out.payload === payload && sameFile(out.file, file);
       // legacy v1 frames must be ignored, not treated as a payload
       rx.ingest('QRX|deadbeef|1/2|AAAA', 'upload');
-      if (payload.length <= SINGLE_MAX) {
-        rx.ingest(opticalDecode(payload, 0, 'M'), 'upload');
-        ok = out === payload;
+      if (isSingle) {
+        rx.ingest(opticalDecode(singleFrameText(payload), 0, 'M'), 'upload');
+        ok = delivered();
         detail = ok ? '1 frame · ' + Math.round(performance.now() - t0) + ' ms' : (err || 'mismatch');
       } else {
         const st = makeFountainState(payload, CHUNK);
@@ -14150,7 +14238,7 @@ async function selfTest() {
           rx.ingest(opticalDecode(fountainFrameText(st, c), tn, 'L'), 'upload');
           repairs++;
         }
-        ok = out === payload;
+        ok = delivered();
         detail = ok
           ? st.k + ' chunks · dropped ' + (st.k - pass.length) + ' · ' + repairs +
             ' repair frames · ' + Math.round(performance.now() - t0) + ' ms'
@@ -14173,10 +14261,10 @@ async function selfTest() {
     rows.push(['oversized payload refused (k > MAX_K)', ok, detail]);
   }
 
-  // malformed frames must not create receiver state. Built from FRAME_PREFIX so a tag
+  // malformed frames must not create receiver state. Built from FRAME_TAG so a tag
   // bump can't turn this into a test of "unknown tags are ignored" instead.
   {
-    const P = FRAME_PREFIX;
+    const P = FRAME_TAG + '|';
     const rx2 = new TransferReceiver({});
     const bad = [
       P + 'deadbeef|10000|5000000|s0|AAAA',   // k over the 4-digit cap
@@ -14214,7 +14302,7 @@ async function selfTest() {
     let ok = false, detail = '';
     try {
       const lrng = mulberry32Int(0xD15C0 + k + Math.round(loss * 100));
-      const payload = 'data:application/octet-stream;base64,' + 'A'.repeat(k * CHUNK - 40);
+      const payload = bytesToBase64(encodeContainer({ bytes: new Uint8Array(3 * (k * CHUNK) / 4 - 15).fill(0x41), mime: '', name: '' }));
       const st = makeFountainState(payload, CHUNK);
       st.baseSeed = 0x5EED0002;                       // deterministic repair frames — test-only override
       let out = null, err = '', missing = 0, repairs = 0;
@@ -14258,9 +14346,115 @@ async function selfTest() {
     const st = makeFountainState('data:application/octet-stream;base64,' + 'A'.repeat(137 * CHUNK - 40), CHUNK);
     st.baseSeed = 0x5EED0003;                         // deterministic repair frames — test-only override
     for (let c = st.k; c < st.k + 3; c++) rx5.ingest(fountainFrameText(st, c), 'camera');
-    rx5.ingest(bytesToBase64(new TextEncoder().encode('stray')), 'camera');
+    rx5.ingest(singleFrameText(bytesToBase64(encodeContainer(textFile('stray')))), 'camera');
     const ok = out === null && !rx5.done;
     rows.push(['stray single QR ignored during a repair-only transfer', ok, ok ? 'ignored' : 'stray QR completed the session']);
+  }
+
+  // ---- container header: CRC-32, filename, MIME, format cutover ----
+  {
+    let ok = false, detail = '';
+    try {
+      const got = crc32(new TextEncoder().encode('123456789'));
+      ok = got === 0xCBF43926;
+      detail = '0x' + got.toString(16);
+    } catch (e) { detail = e.message; }
+    rows.push(['CRC-32 check value ("123456789" → cbf43926)', ok, detail]);
+  }
+  {
+    let ok = false, detail = '';
+    try {
+      const file = { bytes: randomBytes(5000), mime: 'application/pdf', name: 'Réport 2026 ✓.pdf' };
+      let out = null;
+      const rx = new TransferReceiver({ onComplete: (r) => { out = r; } });
+      fountainRun(rx, makeFountainState(bytesToBase64(encodeContainer(file)), CHUNK));
+      ok = !!out && sameFile(out.file, file);
+      detail = ok ? out.file.name + ' · ' + out.file.mime : (out ? 'file mismatch' : 'never completed');
+    } catch (e) { detail = e.message; }
+    rows.push(['container: filename + MIME survive a fountain transfer', ok, detail]);
+  }
+  {
+    let ok = false, detail = '';
+    try {
+      const file = { bytes: new TextEncoder().encode('hi'), mime: 'text/plain', name: 'note.txt' };
+      let out = null;
+      const rx = new TransferReceiver({ onComplete: (r) => { out = r; } });
+      rx.ingest(opticalDecode(singleFrameText(bytesToBase64(encodeContainer(file))), 0, 'M'), 'upload');
+      ok = !!out && sameFile(out.file, file);
+      detail = ok ? out.file.name + ' · ' + out.file.mime : (out ? 'file mismatch' : 'never completed');
+    } catch (e) { detail = e.message; }
+    rows.push(['container: filename + MIME survive a single code', ok, detail]);
+  }
+  {
+    let ok = false, detail = '';
+    try {
+      const c0 = encodeContainer({ bytes: randomBytes(64), mime: 'image/png', name: 'pic.png' });
+      let missed = 0;
+      for (let i = 0; i < c0.length; i++) {
+        for (let bit = 0; bit < 8; bit++) {
+          const c = c0.slice();
+          c[i] ^= 1 << bit;
+          if (decodeContainer(c) !== null) missed++;
+        }
+      }
+      ok = decodeContainer(c0) !== null && missed === 0;
+      detail = c0.length * 8 + ' single-bit flips, ' + missed + ' accepted';
+    } catch (e) { detail = e.message; }
+    rows.push(['container: every single-bit flip rejected (header and body)', ok, detail]);
+  }
+  {
+    let ok = false, detail = '';
+    try {
+      const st = makeFountainState(bytesToBase64(encodeContainer({ bytes: randomBytes(5000), mime: 'application/octet-stream', name: 'x.bin' })), CHUNK);
+      let out = null, err = '';
+      const rx = new TransferReceiver({ onComplete: (r) => { out = r; }, onError: (e) => { err = e; } });
+      for (let c = 0; c < st.k; c++) {
+        let t = fountainFrameText(st, c);
+        if (c === 3) {   // one base64 letter in chunk 3 becomes the next letter: still valid base64 and UTF-8
+          const p = t.split('|');
+          const blk = base64ToBytes(p[p.length - 1]);
+          const j = blk.findIndex((b, i) => i >= 100 && ((b >= 65 && b < 90) || (b >= 97 && b < 122)));
+          blk[j]++;
+          p[p.length - 1] = bytesToBase64(blk);
+          t = p.join('|');
+        }
+        rx.ingest(t, 'upload');
+      }
+      ok = out === null && !rx.done && /checksum/i.test(err);
+      detail = out ? 'corrupted transfer was delivered' : (err || 'no error fired');
+    } catch (e) { detail = e.message; }
+    rows.push(['corrupted chunk caught by the CRC-32', ok, detail]);
+  }
+  {
+    let ok = false, detail = '';
+    try {
+      let out = null;
+      const rx = new TransferReceiver({ onComplete: (r) => { out = r; } });
+      const old = makeFountainState('data:application/octet-stream;base64,' + bytesToBase64(randomBytes(3000)), CHUNK);
+      for (let c = 0; c < old.k; c++) rx.ingest(fountainFrameText(old, c).replace(/^[^|]+\|/, 'QRF|'), 'upload');
+      rx.ingest(fountainFrameText(old, 0).replace(/^[^|]+\|/, 'QRG|'), 'upload');
+      rx.ingest(bytesToBase64(new TextEncoder().encode('hello, QR transfer')), 'upload');   // pre-cutover single code: bare base64
+      rx.ingest('data:text/plain;base64,aGk=', 'upload');                                   // pre-cutover single code: data URI
+      rx.ingest('QRX|deadbeef|1/2|AAAA', 'upload');
+      ok = out === null && !rx.done && rx.transfers.size === 0;
+      detail = ok ? 'QRF frames, bare base64, data URI, QRX: none ingested' : (out ? 'completed with a pre-cutover payload' : rx.transfers.size + ' transfers created');
+    } catch (e) { detail = e.message; }
+    rows.push(['pre-cutover formats ignored, not mis-ingested', ok, detail]);
+  }
+  {
+    let ok = false, detail = '';
+    try {
+      const outs = [];
+      const rx = new TransferReceiver({ onComplete: (r) => { outs.push(r); } });
+      const a = { bytes: randomBytes(4000), mime: 'image/png', name: 'first.png' };
+      const b = { bytes: randomBytes(3500), mime: 'text/csv', name: 'second.csv' };
+      fountainRun(rx, makeFountainState(bytesToBase64(encodeContainer(a)), CHUNK));
+      rx.reset();
+      fountainRun(rx, makeFountainState(bytesToBase64(encodeContainer(b)), CHUNK));
+      ok = outs.length === 2 && sameFile(outs[0].file, a) && sameFile(outs[1].file, b);
+      detail = ok ? outs.map((o) => o.file.name).join(' then ') : outs.length + ' completions';
+    } catch (e) { detail = e.message; }
+    rows.push(['two transfers in a row on one receiver keep their own names', ok, detail]);
   }
 
   // metadata scanner — read-only detection used for the pre-send privacy warning
