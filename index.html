@@ -13429,7 +13429,7 @@ generateBtn.addEventListener('click', async () => {
       blitFrame(renderFrame(singleFrameText(payload), 0, 'M', 4));
       frameCount.textContent = '';
       player.hidden = true;
-      sendHint.textContent = 'Single code — any QR scanner app can read it.';
+      sendHint.textContent = '';
     } else {
       const chunkSize = Number(chunkSel.value);
       const k = Math.ceil(payload.length / chunkSize);
@@ -13983,9 +13983,22 @@ const MIME_EXT = {
   'text/csv': 'csv', 'application/octet-stream': 'bin',
 };
 
-// received filename -> safe download name: no path separators or control characters, no leading dots
+// received filename -> safe download name: path separators, C0/C1 control and
+// Windows-illegal characters become '_'; bidi and zero-width format characters (which
+// can disguise an extension, e.g. U+202E) are dropped; no leading dots or trailing
+// dots/spaces; at most 200 code points, keeping a short extension when truncating
 function safeFileName(name) {
-  return name.replace(/[\u0000-\u001f\u007f/\\]/g, '_').replace(/^[.\s]+/, '').trim().slice(0, 200);
+  let n = name.replace(/[\u0000-\u001f\u007f-\u009f/\\:*?"<>|]/g, '_')
+    .replace(/[​-‏‪-‮⁠-⁩﻿]/g, '')
+    .replace(/^[.\s]+/, '').replace(/[.\s]+$/, '');
+  const cps = Array.from(n);
+  if (cps.length > 200) {
+    const dot = n.lastIndexOf('.');
+    const ext = dot > 0 ? Array.from(n.slice(dot)) : [];
+    const keep = ext.length <= 16 ? ext : [];
+    n = cps.slice(0, 200 - keep.length).join('').replace(/[.\s]+$/, '') + keep.join('');
+  }
+  return n;
 }
 
 const reasm = new TransferReceiver({
@@ -14331,10 +14344,12 @@ async function selfTest() {
       'QRX|deadbeef|1/2|AAAA',                        // v1 sequential frames
       'QRF|deadbeef|3|1200|s0|' + bytesToBase64(new Uint8Array(500)),     // v2 soliton fountain, systematic
       'QRF|deadbeef|3|1200|123456|' + bytesToBase64(new Uint8Array(500)), // v2 soliton fountain, repair
+      'QRG|deadbeef|3|1200|s0|' + bytesToBase64(new Uint8Array(500)),     // v3 dense fountain, systematic
+      'QRG|deadbeef|3|1200|123456|' + bytesToBase64(new Uint8Array(500)), // v3 dense fountain, repair
     ];
     for (const f of legacy) rx4.ingest(f, 'upload');
     const ok = rx4.transfers.size === 0 && !rx4.done && errs.length === 0;
-    rows.push(['legacy QRX/QRF frames ignored', ok,
+    rows.push(['legacy QRX/QRF/QRG frames ignored silently', ok,
       ok ? legacy.length + ' legacy frames, no state created' :
         rx4.transfers.size + ' transfers created · ' + errs.length + ' errors']);
   }
@@ -14456,6 +14471,55 @@ async function selfTest() {
       detail = ok ? outs.map((o) => o.file.name).join(' then ') : outs.length + ' completions';
     } catch (e) { detail = e.message; }
     rows.push(['two transfers in a row on one receiver keep their own names', ok, detail]);
+  }
+
+  // container fields behind a valid CRC: a sender bug (not a misread) must still be rejected
+  {
+    let ok = false, detail = '';
+    try {
+      const reseal = (c) => {
+        new DataView(c.buffer).setUint32(c.length - 4, crc32(c.subarray(0, c.length - 4)), false);
+        return c;
+      };
+      const base = encodeContainer({ bytes: new Uint8Array([1, 2, 3]), mime: 'text/plain', name: 'ab' });
+      const tweak = (f) => { const c = base.slice(); f(c); return reseal(c); };
+      const bad = {
+        'flags=1': tweak((c) => { c[4] = 1; }),
+        'size+1': tweak((c) => { new DataView(c.buffer).setUint32(5, 4, false); }),
+        'size-1': tweak((c) => { new DataView(c.buffer).setUint32(5, 2, false); }),
+        'name not UTF-8': tweak((c) => { c[11 + 10] = 0xFF; }),
+        'MIME control char': tweak((c) => { c[11] = 0x07; }),
+      };
+      const accepted = Object.keys(bad).filter((k) => decodeContainer(bad[k]) !== null);
+      ok = decodeContainer(reseal(base.slice())) !== null && accepted.length === 0;
+      detail = ok ? Object.keys(bad).length + ' resealed malformed containers rejected' : 'accepted: ' + accepted.join(', ');
+    } catch (e) { detail = e.message; }
+    rows.push(['container: malformed fields rejected even with a valid CRC', ok, detail]);
+  }
+  // received filenames: no path, control, bidi or Windows-illegal characters; extension kept
+  {
+    const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    const cases = [
+      ['../../etc/passwd', (o) => o === '_.._etc_passwd'],
+      ['..\\..\\win.ini', (o) => o === '_.._win.ini'],
+      ['...', (o) => o === ''],
+      ['.bashrc', (o) => o === 'bashrc'],
+      ['a\u0007b\u0085c', (o) => o === 'a_b_c'],
+      ['invoice‮fdp.exe', (o) => o === 'invoicefdp.exe'],
+      ['zero​width⁦.txt', (o) => o === 'zerowidth.txt'],
+      ['report.pdf. ', (o) => o === 'report.pdf'],
+      ['x:y*?.txt', (o) => o === 'x_y__.txt'],
+      ['a'.repeat(250) + '.pdf', (o) => Array.from(o).length === 200 && o.endsWith('.pdf')],
+      ['a' + '\u{1F600}'.repeat(150), (o) => Array.from(o).length <= 200 && !lone.test(o)],
+    ];
+    const bad = [];
+    for (const [inp, check] of cases) {
+      let out;
+      try { out = safeFileName(inp); } catch (e) { out = 'threw ' + e.message; }
+      if (!check(out)) bad.push(JSON.stringify(inp.slice(0, 24)) + ' -> ' + JSON.stringify(String(out).slice(0, 24)));
+    }
+    rows.push(['download filenames sanitised', bad.length === 0,
+      bad.length ? bad.join('; ') : cases.length + ' hostile names handled']);
   }
 
   // metadata scanner — read-only detection used for the pre-send privacy warning
