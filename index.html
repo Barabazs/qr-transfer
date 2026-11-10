@@ -14173,21 +14173,29 @@ async function selfTest() {
     rows.push(['oversized payload refused (k > MAX_K)', ok, detail]);
   }
 
-  // malformed frames must not create receiver state
+  // malformed frames must not create receiver state. Built from FRAME_PREFIX so a tag
+  // bump can't turn this into a test of "unknown tags are ignored" instead.
   {
+    const P = FRAME_PREFIX;
     const rx2 = new TransferReceiver({});
     const bad = [
-      'QRG|deadbeef|10000|5000000|s0|AAAA',   // k over the 4-digit cap
-      'QRG|deadbeef|3|1200|s99999|AAAA',      // systematic index over the cap
-      'QRG|DEADBEEF|3|1200|s0|AAAA',          // id not lowercase hex
-      'QRG|deadbeef|3|1200|7|not*base64!',    // body not base64
-      'QRG|deadbeef|3|1200|7|',               // empty body
-      'QRG|deadbeef|3|1200|s0|AAAA',          // len inconsistent with k and block size
+      P + 'deadbeef|10000|5000000|s0|AAAA',   // k over the 4-digit cap
+      P + 'deadbeef|3|1200|s99999|AAAA',      // systematic index over the cap
+      P + 'DEADBEEF|3|1200|s0|AAAA',          // id not lowercase hex
+      P + 'deadbeef|3|1200|7|not*base64!',    // body not base64
+      P + 'deadbeef|3|1200|7|',               // empty body
+      P + 'deadbeef|3|1200|s0|AAAA',          // len inconsistent with k and block size
     ];
     for (const b of bad) rx2.ingest(b, 'upload');
-    const ok = rx2.transfers.size === 0 && !rx2.done;
+    // control: a well-formed frame with the same prefix does create state, so the frames
+    // above were rejected by field validation, not by their tag
+    const rxc = new TransferReceiver({});
+    const good = fountainFrameText(makeFountainState('A'.repeat(SINGLE_MAX + 4), CHUNK), 0);
+    rxc.ingest(good, 'upload');
+    const ok = rx2.transfers.size === 0 && !rx2.done && rxc.transfers.size === 1 && good.startsWith(P);
     rows.push(['malformed frames ignored', ok,
-      ok ? bad.length + ' bad frames, no state created' : rx2.transfers.size + ' transfers created']);
+      ok ? bad.length + ' bad frames, no state created; control frame accepted'
+         : rx2.transfers.size + ' transfers created · control frame ' + (rxc.transfers.size ? 'accepted' : 'rejected')]);
   }
   // a transfer that reassembles into garbage must error, not complete
   {
