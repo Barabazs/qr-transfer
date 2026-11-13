@@ -7,17 +7,18 @@ Ethereum Swarm.
 - **Send**: text becomes plain base64; any file becomes a `data:<mime>;base64,...` URI.
   Payloads that fit in one QR (≤ 2,331 bytes, EC level M) are emitted as a plain QR any
   scanner app can read. Bigger payloads stream as **fountain-coded** frames
-  (`QRF|<transferId>|<k>|<len>|<seed>|<b64 xor-block>`, EC level L, fixed QR version per
+  (`QRG|<transferId>|<k>|<len>|<seed>|<b64 xor-block>`, EC level L, fixed QR version per
   transfer): first a systematic pass (each of the `k` chunks once, in order — a clean
   first pass completes immediately), then an endless deterministic stream of repair
-  frames, each the XOR of a pseudo-random chunk set (robust-soliton degree, seed in the
+  frames, each the XOR of a pseudo-random half of all chunks (seed in the
   frame). Any repair frame can patch whatever the receiver is missing, so a missed frame
   never costs another full loop. Frames are generated live — no pre-render stall on
   large payloads.
 - **Receive**: live camera scanning — adaptive rate (scans as fast as decode completes,
   up to ~40 Hz) with the native `BarcodeDetector` API where available (Android Chrome)
-  and jsQR everywhere else — or dropped/uploaded QR images, fed through a peeling
-  (belief-propagation) fountain decoder. Output is the encoded string verbatim, plus a
+  and jsQR everywhere else — or dropped/uploaded QR images, fed through a GF(2)
+  elimination decoder: a receiver missing m chunks needs about m + 2 repair frames,
+  whichever ones it catches. Output is the encoded string verbatim, plus a
   decode panel (image preview / text / download). Filenames are not carried — downloads
   get a name like `qr-transfer-<id>.<ext>`, with the extension guessed from the MIME
   type.
@@ -30,13 +31,15 @@ most desktop browsers; plain `http://<lan-ip>` does not (use the image-upload pa
 there).
 
 Practical pacing at the defaults (500 B chunks, 8 fps): a 50 KB file is ~137 chunks ≈
-17 s for the systematic pass, then a handful of seconds of repair frames for whatever
-was missed — total is roughly one pass plus 10–30 %, regardless of *which* frames were
+17 s for the systematic pass, then repair frames for whatever was missed. Frames
+shown ≈ one pass ÷ the fraction the camera catches, plus about 2: one pass + ~6 % at
+5 % frame loss, + ~25 % at 20 %, + ~68 % at 40 %, regardless of *which* frames were
 dropped. The page warns above 100 KB encoded (base64 is ≈ ⅓ larger than the source
-file), and again above 500 KB. Transfers are hard-capped at 9,999 chunks — the QRF
-frame format's limit (≈ 4.77 MB encoded at the default 500 B frame size). The old
-sequential `QRX` format is gone (hard cutover); previously exported `QRX` frame images
-are no longer readable.
+file), and again above 500 KB. Transfers are hard-capped at 9,999 chunks — the frame
+format's limit (≈ 4.77 MB encoded at the default 500 B frame size). Older
+frame formats are gone (hard cutovers): sequential `QRX` frames and soliton-coded `QRF`
+frames, including previously exported frame PNGs, are ignored by the receiver. Sender
+and receiver must both run this version.
 
 Self-test (full in-memory optical round trip, no camera needed):
 
@@ -60,7 +63,7 @@ warning. Small transfers stay pleasant; multi-hundred-KB ones mean minutes of ho
 the phone still.
 
 **Can a normal scanner app read the codes?** The small single-code payloads, yes.
-Streamed QRF frames mean nothing to other scanners — the receiving end has to be this
+Streamed QRG frames mean nothing to other scanners — the receiving end has to be this
 page.
 
 **What if the receiver misses frames?** Nothing to do. Repair frames keep coming and

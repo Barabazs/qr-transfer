@@ -430,7 +430,7 @@ footer a { color: var(--ink); text-underline-offset: 2px; }
   </details>
   <details>
     <summary>Can a normal scanner app read these codes?</summary>
-    <p>The small single-code payloads, yes. Streamed <code>QRF</code> frames mean nothing
+    <p>The small single-code payloads, yes. Streamed <code>QRG</code> frames mean nothing
     to other scanners — the receiving end has to be this page.</p>
   </details>
   <details>
@@ -472,7 +472,7 @@ footer a { color: var(--ink); text-underline-offset: 2px; }
 
 <footer>
   Payloads that fit in one QR code are plain — any scanner app can read them. Bigger payloads stream
-  as <span style="font-family:var(--mono)">QRF</span> fountain frames: after a first pass through the
+  as <span style="font-family:var(--mono)">QRG</span> fountain frames: after a first pass through the
   chunks, endless XOR repair frames follow, and <em>any</em> of them can patch what the receiver is
   missing — a missed frame never costs another full loop. Nothing leaves your device.
   And nothing is guaranteed: there is no end-to-end checksum, so check important
@@ -12942,8 +12942,17 @@ function mulberry32Int(a) {
     return (t ^ (t >>> 14)) >>> 0;
   };
 }
+// 4 bytes at a time when both views are word-aligned (all chunk buffers here are);
+// the fountain decoder spends most of its time in this loop
 function xorInto(dst, src) {
-  for (let i = 0; i < dst.length; i++) dst[i] ^= src[i];
+  const n = dst.length;
+  if ((n & 3) === 0 && (dst.byteOffset & 3) === 0 && (src.byteOffset & 3) === 0) {
+    const d = new Uint32Array(dst.buffer, dst.byteOffset, n >>> 2);
+    const r = new Uint32Array(src.buffer, src.byteOffset, n >>> 2);
+    for (let i = 0; i < d.length; i++) d[i] ^= r[i];
+    return;
+  }
+  for (let i = 0; i < n; i++) dst[i] ^= src[i];
 }
 function fmtBytes(n) {
   if (n < 1024) return n + ' B';
@@ -13081,101 +13090,72 @@ function scanImageMetadata(bytes) {
 }
 
 /* ============================================================
-   §2 protocol (pure) — QRF fountain frames
-   Frame:      QRF|<id>|<k>|<len>|<seed>|<b64 xor-block>
+   §2 protocol (pure) — QRG fountain frames
+   Frame:      QRG|<id>|<k>|<len>|<seed>|<b64 xor-block>
    seed "s<n>" = systematic frame carrying chunk n alone;
-   numeric seed drives the PRNG that picks the XORed chunk set.
+   numeric seed drives the PRNG that picks the dense XORed chunk set
+   (each chunk with probability ½ — denseRowFromSeed).
+   Dead formats, ignored on receive: QRX| (v1 sequential), QRF| (v2 soliton).
    Payload ≤ SINGLE_MAX is emitted headerless (stock-scanner readable).
    ============================================================ */
 
-// robust soliton degree distribution, quantized to uint32 so both sides
-// binary-search identical tables (Math.log/sqrt engine variance is ~1e-16,
-// far below the 2^-32 quantization step)
-function solitonCdfQ(k) {
-  const DELTA = 0.05, C = 0.1;
-  const S = C * Math.log(k / DELTA) * Math.sqrt(k);
-  const pivot = Math.max(1, Math.min(k, Math.round(k / S)));
-  const w = new Float64Array(k);
-  for (let d = 1; d <= k; d++) {
-    const rho = d === 1 ? 1 / k : 1 / (d * (d - 1));
-    const tau = d < pivot ? S / (k * d) : d === pivot ? (S * Math.log(S / DELTA)) / k : 0;
-    w[d - 1] = rho + tau;
-  }
-  let z = 0;
-  for (let i = 0; i < k; i++) z += w[i];
-  const cdf = new Uint32Array(k);
-  let cum = 0;
-  for (let i = 0; i < k; i++) {
-    cum += w[i] / z;
-    cdf[i] = Math.min(4294967295, Math.round(cum * 4294967295));
-  }
-  cdf[k - 1] = 4294967295;
-  return cdf;
-}
-function sampleDegree(cdfQ, r) {
-  let lo = 0, hi = cdfQ.length - 1;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (cdfQ[mid] < r) lo = mid + 1; else hi = mid;
-  }
-  return lo + 1;
-}
-// sparse Fisher-Yates: d distinct indices from [0, k)
-function pickIndices(prng, k, d) {
-  const swap = new Map();
-  const out = [];
-  for (let i = 0; i < d; i++) {
-    const j = i + (prng() % (k - i));
-    const vi = swap.has(i) ? swap.get(i) : i;
-    const vj = swap.has(j) ? swap.get(j) : j;
-    out.push(vj);
-    swap.set(j, vi);
-    swap.set(i, vj);
-  }
-  return out;
-}
-function indicesFromSeed(seed, k, cdfQ) {
+const FRAME_PREFIX = 'QRG|';
+
+// dense repair row for a numeric seed: bit i (word i >>> 5, bit i & 31) set = chunk i
+// is XORed in. Every chunk joins with probability ½, so any m still-missing chunks are
+// almost surely solvable from m + 2 or so repair frames (GF(2) elimination, §5).
+// Both sides must derive identical rows from a frame's seed.
+function denseRowFromSeed(seed, k) {
+  const words = (k + 31) >>> 5;
+  const row = new Uint32Array(words);
   const prng = mulberry32Int(seed);
-  const d = Math.min(k, sampleDegree(cdfQ, prng()));
-  return pickIndices(prng, k, d);
+  for (let w = 0; w < words; w++) row[w] = prng();
+  if (k & 31) row[words - 1] &= (1 << (k & 31)) - 1;     // clear bits past chunk k-1
+  let any = 0;
+  for (let w = 0; w < words; w++) any |= row[w];
+  if (!any) { const i = seed % k; row[i >>> 5] |= 1 << (i & 31); }   // never an empty XOR
+  return row;
+}
+function rowHas(row, i) {
+  return (row[i >>> 5] >>> (i & 31)) & 1;
 }
 
-// sender-side state: payload string -> padded chunks + degree table
+// sender-side state: payload string -> padded chunks
 function makeFountainState(payload, chunkSize) {
   const bytes = new TextEncoder().encode(payload);
   const s = chunkSize;
   const k = Math.ceil(bytes.length / s);
-  if (k > MAX_K) throw new Error('payload needs ' + k + ' chunks; the QRF frame format allows at most ' + MAX_K);
+  if (k > MAX_K) throw new Error('payload needs ' + k + ' chunks; the frame format allows at most ' + MAX_K);
   const chunks = [];
   for (let i = 0; i < k; i++) {
     const c = new Uint8Array(s);                    // zero-padded final chunk
     c.set(bytes.subarray(i * s, Math.min((i + 1) * s, bytes.length)));
     chunks.push(c);
   }
-  return { id: randomId(), k, len: bytes.length, s, chunks, cdfQ: solitonCdfQ(k), baseSeed: rand32() };
+  return { id: randomId(), k, len: bytes.length, s, chunks, baseSeed: rand32() };
 }
 function seedForCounter(st, c) {
   return (st.baseSeed + Math.imul(c, 2654435761)) >>> 0;
 }
 // frame text for counter c: first k frames are the chunks in order (systematic
-// pass), everything after is an endless deterministic stream of repair frames
+// pass), everything after is an endless deterministic stream of dense repair frames
 function fountainFrameText(st, c) {
-  let indices, seedStr;
+  const block = new Uint8Array(st.s);
+  let seedStr;
   if (c < st.k) {
-    indices = [c];
+    block.set(st.chunks[c]);
     seedStr = 's' + c;
   } else {
     const seed = seedForCounter(st, c);
-    indices = indicesFromSeed(seed, st.k, st.cdfQ);
+    const row = denseRowFromSeed(seed, st.k);
+    for (let i = 0; i < st.k; i++) if (rowHas(row, i)) xorInto(block, st.chunks[i]);
     seedStr = String(seed);
   }
-  const block = new Uint8Array(st.s);
-  for (const i of indices) xorInto(block, st.chunks[i]);
-  return 'QRF|' + st.id + '|' + st.k + '|' + st.len + '|' + seedStr + '|' + bytesToBase64(block);
+  return FRAME_PREFIX + st.id + '|' + st.k + '|' + st.len + '|' + seedStr + '|' + bytesToBase64(block);
 }
 
 function parseFrame(str) {
-  if (str.startsWith('QRF|')) {
+  if (str.startsWith(FRAME_PREFIX)) {
     const p = str.split('|');
     if (p.length === 6 && /^[0-9a-f]{8}$/.test(p[1]) && /^[1-9]\d{0,3}$/.test(p[2]) &&
         /^[1-9]\d{0,7}$/.test(p[3]) && /^(s\d{1,4}|\d{1,10})$/.test(p[4]) &&
@@ -13184,7 +13164,7 @@ function parseFrame(str) {
     }
     return { kind: 'invalid' };
   }
-  if (str.startsWith('QRX|')) return { kind: 'invalid' };   // dead v1 format
+  if (str.startsWith('QRX|') || str.startsWith('QRF|')) return { kind: 'invalid' };   // dead v1/v2 formats
   return { kind: 'complete', body: str.trim() };
 }
 function validatePayload(payload) {
@@ -13230,7 +13210,7 @@ function renderFrame(text, typeNumber, ecLevel, cellSize) {
 }
 // fixed QR version for a whole transfer, sized for the worst-case frame
 function transferTypeNumber(st) {
-  const worst = 'QRF|' + st.id + '|' + st.k + '|' + st.len + '|4294967295|' +
+  const worst = FRAME_PREFIX + st.id + '|' + st.k + '|' + st.len + '|4294967295|' +
     'A'.repeat(4 * Math.ceil(st.s / 3));
   return fitTypeNumber(worst, 'L');
 }
@@ -13509,7 +13489,7 @@ $('export').addEventListener('click', async () => {
     }
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'qrf-chunk-' + String(i + 1).padStart(4, '0') + 'of' + total + '.png';
+    a.download = 'qrg-chunk-' + String(i + 1).padStart(4, '0') + 'of' + total + '.png';
     a.click();
     URL.revokeObjectURL(a.href);
     await new Promise((r) => setTimeout(r, 60)); // avoid download-storm blocking
@@ -13536,65 +13516,75 @@ function copyText(textarea, btn) {
 /* ============================================================
    §5 fountain decoder (pure) + per-transfer receiver
    ============================================================ */
+// GF(2) elimination decoder. Each frame is one equation: XOR of the chunks in its row
+// = its block. Known chunks are XORed out on arrival; what remains is kept in reduced
+// row echelon form, keyed by pivot column: no stored row has a decoded chunk's bit or
+// another stored row's pivot bit set. A stored row left with only its pivot bit is a
+// decoded chunk. rank = equations held that are not yet chunks.
 class FountainDecoder {
   constructor(k, len, s) {
     this.k = k; this.len = len; this.s = s;
+    this.words = (k + 31) >>> 5;
     this.chunks = new Array(k).fill(null);
     this.decoded = 0;
-    this.pending = [];          // {set: Set<int>, block: Uint8Array}
+    this.rows = new Map();      // pivot column -> {row: Uint32Array, block: Uint8Array}
     this.seen = new Set();      // seed strings
-    this.cdfQ = solitonCdfQ(k);
   }
+  get rank() { return this.rows.size; }
+  // true when the frame added information (a new chunk or a new independent equation)
   addFrame(seedStr, block) {
     if (block.length !== this.s || this.seen.has(seedStr)) return false;
     this.seen.add(seedStr);
-    let indices;
+    let row;
     if (seedStr[0] === 's') {
       const i = +seedStr.slice(1);
       if (!(i >= 0 && i < this.k)) return false;
-      indices = [i];
+      if (this.chunks[i]) return false;
+      row = new Uint32Array(this.words);
+      row[i >>> 5] = 1 << (i & 31);
     } else {
-      indices = indicesFromSeed((+seedStr) >>> 0, this.k, this.cdfQ);
+      row = denseRowFromSeed((+seedStr) >>> 0, this.k);
     }
-    const set = new Set(indices);
-    const b = block.slice();
-    for (const i of indices) {
-      if (this.chunks[i]) { xorInto(b, this.chunks[i]); set.delete(i); }
-    }
-    if (set.size === 0) return false;                 // pure redundancy
-    if (set.size === 1) {
-      this.decodeChunk(set.values().next().value, b);
-      return true;
-    }
-    this.pending.push({ set, block: b });
-    return false;
+    return this.insert(row, block.slice());
   }
-  decodeChunk(idx, block) {
-    if (this.chunks[idx]) return;
-    this.chunks[idx] = block;
-    this.decoded++;
-    const queue = [idx];
-    while (queue.length) {                            // peel the cascade
-      const i = queue.shift();
-      const survivors = [];
-      for (const e of this.pending) {
-        if (e.set.has(i)) {
-          xorInto(e.block, this.chunks[i]);
-          e.set.delete(i);
-        }
-        if (e.set.size === 1) {
-          const j = e.set.values().next().value;
-          if (!this.chunks[j]) {
-            this.chunks[j] = e.block;
-            this.decoded++;
-            queue.push(j);
-          }
-        } else if (e.set.size > 1) {
-          survivors.push(e);
-        }
+  insert(row, b) {
+    // 1. XOR out chunks already decoded
+    for (let w = 0; w < this.words; w++) {
+      let bits = row[w];
+      while (bits) {
+        const low = bits & -bits;
+        bits ^= low;
+        const i = (w << 5) + 31 - Math.clz32(low);
+        if (this.chunks[i]) { xorInto(b, this.chunks[i]); row[w] ^= low; }
       }
-      this.pending = survivors;
     }
+    // 2. reduce by the stored rows (none of them has another stored row's pivot set,
+    //    so the order of these XORs does not matter)
+    for (const [p, r] of this.rows) {
+      if (rowHas(row, p)) { xorRow(row, r.row); xorInto(b, r.block); }
+    }
+    // 3. lowest remaining bit becomes the pivot; nothing left = redundant frame
+    let q = -1;
+    for (let w = 0; w < this.words; w++) {
+      if (row[w]) { q = (w << 5) + 31 - Math.clz32(row[w] & -row[w]); break; }
+    }
+    if (q < 0) return false;
+    // 4. clear the new pivot from every stored row, then store the new row
+    const touched = [q];
+    for (const [p, r] of this.rows) {
+      if (rowHas(r.row, q)) { xorRow(r.row, row); xorInto(r.block, b); touched.push(p); }
+    }
+    this.rows.set(q, { row, block: b });
+    // 5. rows reduced to their pivot alone are decoded chunks
+    for (const p of touched) {
+      const r = this.rows.get(p);
+      if (isSingleBit(r.row)) {
+        this.rows.delete(p);
+        this.chunks[p] = r.block;
+        this.decoded++;
+      }
+    }
+    return true;
   }
   payloadBytes() {
     const out = new Uint8Array(this.len);
@@ -13604,6 +13594,19 @@ class FountainDecoder {
     }
     return out;
   }
+}
+function xorRow(dst, src) {
+  for (let w = 0; w < dst.length; w++) dst[w] ^= src[w];
+}
+function isSingleBit(row) {
+  let seen = false;
+  for (let w = 0; w < row.length; w++) {
+    const x = row[w];
+    if (!x) continue;
+    if (seen || (x & (x - 1))) return false;
+    seen = true;
+  }
+  return seen;
 }
 
 class TransferReceiver {
@@ -13621,7 +13624,7 @@ class TransferReceiver {
   }
   hasActiveTransfer() {
     for (const t of this.transfers.values()) {
-      if (t.dec.decoded > 0 && t.dec.decoded < t.dec.k) return true;
+      if ((t.dec.decoded > 0 || t.dec.rank > 0) && t.dec.decoded < t.dec.k) return true;
     }
     return false;
   }
@@ -13661,7 +13664,7 @@ class TransferReceiver {
     t.framesSeen++;
     t.dec.addFrame(f.seedStr, block);
     this.onProgress({
-      id: f.id, decoded: t.dec.decoded, k: t.dec.k,
+      id: f.id, decoded: t.dec.decoded, rank: t.dec.rank, k: t.dec.k,
       have: t.dec.chunks.map(Boolean), framesSeen: t.framesSeen,
     });
     if (t.dec.decoded === t.dec.k) {
@@ -13916,13 +13919,13 @@ function parsePayload(payload) {
 }
 
 const reasm = new TransferReceiver({
-  onProgress({ id, decoded, k, have, framesSeen }) {
+  onProgress({ id, decoded, rank, k, have, framesSeen }) {
     stripWrap.hidden = false;
     stripWrap.setAttribute('aria-valuemax', k);
     stripWrap.setAttribute('aria-valuenow', decoded);
     stripWrap.setAttribute('aria-valuetext', decoded + ' of ' + k + ' chunks');
-    progressLabel.textContent = 'Transfer ' + id + ' — ' + decoded + ' of ' + k +
-      ' chunks · ' + framesSeen + ' frames seen';
+    progressLabel.textContent = 'Transfer ' + id + ' — ' + decoded + ' of ' + k + ' chunks' +
+      (rank ? ' + ' + rank + ' repair equations' : '') + ' · ' + framesSeen + ' frames seen';
     drawStrip(have);
     setStatus(decoded === k ? 'All chunks decoded.' : 'Receiving… every new frame helps, none needs to be caught twice.');
   },
@@ -14170,21 +14173,29 @@ async function selfTest() {
     rows.push(['oversized payload refused (k > MAX_K)', ok, detail]);
   }
 
-  // malformed frames must not create receiver state
+  // malformed frames must not create receiver state. Built from FRAME_PREFIX so a tag
+  // bump can't turn this into a test of "unknown tags are ignored" instead.
   {
+    const P = FRAME_PREFIX;
     const rx2 = new TransferReceiver({});
     const bad = [
-      'QRF|deadbeef|10000|5000000|s0|AAAA',   // k over the 4-digit cap
-      'QRF|deadbeef|3|1200|s99999|AAAA',      // systematic index over the cap
-      'QRF|DEADBEEF|3|1200|s0|AAAA',          // id not lowercase hex
-      'QRF|deadbeef|3|1200|7|not*base64!',    // body not base64
-      'QRF|deadbeef|3|1200|7|',               // empty body
-      'QRF|deadbeef|3|1200|s0|AAAA',          // len inconsistent with k and block size
+      P + 'deadbeef|10000|5000000|s0|AAAA',   // k over the 4-digit cap
+      P + 'deadbeef|3|1200|s99999|AAAA',      // systematic index over the cap
+      P + 'DEADBEEF|3|1200|s0|AAAA',          // id not lowercase hex
+      P + 'deadbeef|3|1200|7|not*base64!',    // body not base64
+      P + 'deadbeef|3|1200|7|',               // empty body
+      P + 'deadbeef|3|1200|s0|AAAA',          // len inconsistent with k and block size
     ];
     for (const b of bad) rx2.ingest(b, 'upload');
-    const ok = rx2.transfers.size === 0 && !rx2.done;
+    // control: a well-formed frame with the same prefix does create state, so the frames
+    // above were rejected by field validation, not by their tag
+    const rxc = new TransferReceiver({});
+    const good = fountainFrameText(makeFountainState('A'.repeat(SINGLE_MAX + 4), CHUNK), 0);
+    rxc.ingest(good, 'upload');
+    const ok = rx2.transfers.size === 0 && !rx2.done && rxc.transfers.size === 1 && good.startsWith(P);
     rows.push(['malformed frames ignored', ok,
-      ok ? bad.length + ' bad frames, no state created' : rx2.transfers.size + ' transfers created']);
+      ok ? bad.length + ' bad frames, no state created; control frame accepted'
+         : rx2.transfers.size + ' transfers created · control frame ' + (rxc.transfers.size ? 'accepted' : 'rejected')]);
   }
   // a transfer that reassembles into garbage must error, not complete
   {
@@ -14194,6 +14205,62 @@ async function selfTest() {
     for (let c = 0; c < st.k; c++) rx2.ingest(fountainFrameText(st, c), 'upload');
     const ok = /corrupt/i.test(err) && !rx2.done;
     rows.push(['corrupt reassembly rejected', ok, err || 'no error fired']);
+  }
+
+  // dense repair frames: after a lossy systematic pass the receiver needs about as many
+  // repair frames as chunks it missed (GF(2) elimination). The soliton + peeling decoder
+  // this replaced needed 17 / 49 / 270 / 231 repair frames on these four cases.
+  for (const [k, loss] of [[137, 0.05], [137, 0.2], [400, 0.4], [137, 1]]) {
+    let ok = false, detail = '';
+    try {
+      const lrng = mulberry32Int(0xD15C0 + k + Math.round(loss * 100));
+      const payload = 'data:application/octet-stream;base64,' + 'A'.repeat(k * CHUNK - 40);
+      const st = makeFountainState(payload, CHUNK);
+      st.baseSeed = 0x5EED0002;                       // deterministic repair frames — test-only override
+      let out = null, err = '', missing = 0, repairs = 0;
+      const rx3 = new TransferReceiver({ onComplete: (res) => { out = res.payload; }, onError: (e) => { err = e; } });
+      for (let c = 0; c < st.k; c++) {
+        if (lrng() / 4294967296 < loss) missing++;
+        else rx3.ingest(fountainFrameText(st, c), 'upload');
+      }
+      for (let c = st.k; out === null && !err && c < st.k * 4 + 50; c++) {
+        rx3.ingest(fountainFrameText(st, c), 'upload');
+        repairs++;
+      }
+      ok = out === payload && repairs <= missing + 8;
+      detail = 'k=' + st.k + ' · missed ' + missing + ' · ' + repairs + ' repair frames' +
+        (out === payload ? '' : ' · ' + (err || 'never completed'));
+    } catch (e) { detail = e.message; }
+    rows.push(['repair frames ≈ chunks missed (k=' + k + ', ' + Math.round(loss * 100) + '% systematic loss)', ok, detail]);
+  }
+
+  // previous frame formats must be ignored, never ingested as transfer data
+  {
+    const errs = [];
+    const rx4 = new TransferReceiver({ onError: (e) => { errs.push(e); } });
+    const legacy = [
+      'QRX|deadbeef|1/2|AAAA',                        // v1 sequential frames
+      'QRF|deadbeef|3|1200|s0|' + bytesToBase64(new Uint8Array(500)),     // v2 soliton fountain, systematic
+      'QRF|deadbeef|3|1200|123456|' + bytesToBase64(new Uint8Array(500)), // v2 soliton fountain, repair
+    ];
+    for (const f of legacy) rx4.ingest(f, 'upload');
+    const ok = rx4.transfers.size === 0 && !rx4.done && errs.length === 0;
+    rows.push(['legacy QRX/QRF frames ignored', ok,
+      ok ? legacy.length + ' legacy frames, no state created' :
+        rx4.transfers.size + ' transfers created · ' + errs.length + ' errors']);
+  }
+
+  // a stray single QR must not hijack a camera session that holds only repair equations
+  // (joined mid-stream: no chunk decoded yet, but rank > 0)
+  {
+    let out = null;
+    const rx5 = new TransferReceiver({ onComplete: (res) => { out = res; } });
+    const st = makeFountainState('data:application/octet-stream;base64,' + 'A'.repeat(137 * CHUNK - 40), CHUNK);
+    st.baseSeed = 0x5EED0003;                         // deterministic repair frames — test-only override
+    for (let c = st.k; c < st.k + 3; c++) rx5.ingest(fountainFrameText(st, c), 'camera');
+    rx5.ingest(bytesToBase64(new TextEncoder().encode('stray')), 'camera');
+    const ok = out === null && !rx5.done;
+    rows.push(['stray single QR ignored during a repair-only transfer', ok, ok ? 'ignored' : 'stray QR completed the session']);
   }
 
   // metadata scanner — read-only detection used for the pre-send privacy warning
