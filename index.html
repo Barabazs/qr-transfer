@@ -12941,7 +12941,8 @@ function base45Encode(bytes) {
   return out;
 }
 // -> Uint8Array, or null for a non-Base45 character, a dangling character (length 3n+1)
-// or a group over its range (65535 for three characters, 255 for a trailing two)
+// or a group over its range (65535 for three characters, 255 for a trailing two).
+// The length check is a fast path: val() past the end is also -1 (charCodeAt -> NaN).
 function base45Decode(str) {
   const n = str.length;
   if (n % 3 === 1) return null;
@@ -14378,7 +14379,7 @@ async function selfTest() {
       P + 'deadbeef|3|1200|s99999|AAA',       // systematic index over the cap
       P + 'DEADBEEF|3|1200|s0|AAA',           // id not lowercase hex
       P + 'deadbeef|3|1200|7|not base45!',    // body not Base45 (lowercase, '!')
-      P + 'deadbeef|2|4|7|AAAA',              // body with a dangling Base45 character (header fits a 3-byte block)
+      P + 'deadbeef|2|4|7|AAAA',              // body of length 3n+1, never valid Base45 (header fits a 3-byte block)
       P + 'deadbeef|2|3|7|GGW',               // Base45 group over 65535 (header fits a 2-byte block)
       P + 'deadbeef|3|1200|7|',               // empty body
       P + 'deadbeef|3|1200|s0|AAA',           // len inconsistent with k and block size
@@ -14564,8 +14565,14 @@ async function selfTest() {
         rx.ingest('QRC|0123abcd|' + qk + '|' + qrcText.length + '|s' + c + '|' + bytesToBase64(blk), 'upload');
       }
       rx.ingest('QRC|' + bytesToBase64(encodeContainer(textFile('old single'))), 'upload');
+      // the same transfer and single code in today's encoding, re-tagged QRC: the bodies are
+      // valid Base45, so only the tag check keeps them out
+      const retag = (t) => t.replace(/^[^|]+\|/, 'QRC|');
+      const cur = makeFountainState(encodeContainer({ bytes: randomBytes(3000), mime: 'text/plain', name: 'retag.txt' }), CHUNK);
+      for (let c = 0; c < cur.k; c++) rx.ingest(retag(fountainFrameText(cur, c)), 'upload');
+      rx.ingest(retag(singleFrameText(encodeContainer(textFile('retagged single')))), 'upload');
       ok = out === null && !rx.done && rx.transfers.size === 0;
-      detail = ok ? 'QRC transfer + single, QRF frames, bare base64, data URI, QRX: none ingested' : (out ? 'completed with a pre-cutover payload' : rx.transfers.size + ' transfers created');
+      detail = ok ? 'QRC transfer + single (old and Base45 bodies), QRF frames, bare base64, data URI, QRX: none ingested' : (out ? 'completed with a pre-cutover payload' : rx.transfers.size + ' transfers created');
     } catch (e) { detail = e.message; }
     rows.push(['pre-cutover formats ignored, not mis-ingested', ok, detail]);
   }
