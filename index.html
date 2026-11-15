@@ -46,6 +46,7 @@
   --laser-text: #c0240c; /* darker red for text runs — --laser is 4.1:1 on --paper, below AA */
   --muted: #666a66;
   --line: #d2d6d1;
+  --strip-pending: #666a66; /* ≥ 3:1 against --ink and --line (WCAG 1.4.11) */
   --stage: #ffffff;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -59,6 +60,7 @@
     --laser-text: #ff5a3c;
     --muted: #8d918c;
     --line: #313530;
+    --strip-pending: #7f837e;
   }
 }
 * { box-sizing: border-box; }
@@ -13753,7 +13755,7 @@ class TransferReceiver {
     t.dec.addFrame(f.seedStr, block);
     this.onProgress({
       id: f.id, decoded: t.dec.decoded, rank: t.dec.rank, k: t.dec.k,
-      have: t.dec.chunks.map(Boolean), framesSeen: t.framesSeen,
+      have: t.dec.chunks.map(Boolean), pending: [...t.dec.rows.keys()], framesSeen: t.framesSeen,
     });
     if (t.dec.decoded === t.dec.k) {
       let payload = null, file = null;
@@ -13979,19 +13981,41 @@ const copyResultBtn = $('copy-result');
 let downloadUrl = null;
 let resultDecodedText = null;
 
-function drawStrip(have) {
+// have[i]: chunk i decoded (--ink). pending: pivot chunk of each held repair equation,
+// never a decoded chunk, one per equation (--strip-pending). The filled share of the strip
+// is (decoded + rank) / k at every k:
+// - cells ≥ 3 px wide (k ≤ 233): one block per chunk;
+// - narrower: each pixel column summarises the chunks it covers, ink height = decoded
+//   share, grey stacked above it = pending share (one colour per column would let a
+//   decoded neighbour hide every repair equation once k > ~350).
+function drawStrip(have, pending) {
   const n = have.length;
   const W = 700, H = 14;
   stripCanvas.width = W;
   stripCanvas.height = H;
   const ctx = stripCanvas.getContext('2d');
   const css = getComputedStyle(document.documentElement);
+  const ink = css.getPropertyValue('--ink').trim(), grey = css.getPropertyValue('--strip-pending').trim();
   ctx.fillStyle = css.getPropertyValue('--line').trim();
   ctx.fillRect(0, 0, W, H);
-  ctx.fillStyle = css.getPropertyValue('--ink').trim();
   const cell = W / n;
-  for (let i = 0; i < n; i++) {
-    if (have[i]) ctx.fillRect(Math.floor(i * cell), 0, Math.max(1, Math.ceil(cell) - (cell > 3 ? 1 : 0)), H);
+  if (cell >= 3) {
+    const w = Math.ceil(cell) - 1;
+    ctx.fillStyle = grey;
+    for (const i of pending) ctx.fillRect(Math.floor(i * cell), 0, w, H);
+    ctx.fillStyle = ink;
+    for (let i = 0; i < n; i++) if (have[i]) ctx.fillRect(Math.floor(i * cell), 0, w, H);
+    return;
+  }
+  const isPending = new Uint8Array(n);
+  for (const i of pending) isPending[i] = 1;
+  for (let x = 0; x < W; x++) {
+    const a = Math.floor(x * n / W), b = Math.max(a + 1, Math.floor((x + 1) * n / W));
+    let d = 0, p = 0;
+    for (let i = a; i < b; i++) { if (have[i]) d++; else if (isPending[i]) p++; }
+    const hd = Math.round(H * d / (b - a)), hp = Math.round(H * (d + p) / (b - a)) - hd;
+    if (hd) { ctx.fillStyle = ink; ctx.fillRect(x, H - hd, 1, hd); }
+    if (hp) { ctx.fillStyle = grey; ctx.fillRect(x, H - hd - hp, 1, hp); }
   }
 }
 
@@ -14021,14 +14045,20 @@ function safeFileName(name) {
 }
 
 const reasm = new TransferReceiver({
-  onProgress({ id, decoded, rank, k, have, framesSeen }) {
+  onProgress({ id, decoded, rank, k, have, pending, framesSeen }) {
+    // decoded chunks and held repair equations are both independent equations; k of them
+    // finish the transfer, and almost every new repair frame adds one
+    const need = k - decoded - rank;
+    const counts = decoded + ' of ' + k + ' chunks' +
+      (rank ? ' + ' + rank + ' repair equation' + (rank === 1 ? '' : 's') : '');
+    const left = need > 0 ? 'about ' + need + ' more frame' + (need === 1 ? '' : 's') + ' needed' : '';
     stripWrap.hidden = false;
     stripWrap.setAttribute('aria-valuemax', k);
-    stripWrap.setAttribute('aria-valuenow', decoded);
-    stripWrap.setAttribute('aria-valuetext', decoded + ' of ' + k + ' chunks');
-    progressLabel.textContent = 'Transfer ' + id + ' — ' + decoded + ' of ' + k + ' chunks' +
-      (rank ? ' + ' + rank + ' repair equations' : '') + ' · ' + framesSeen + ' frames seen';
-    drawStrip(have);
+    stripWrap.setAttribute('aria-valuenow', decoded + rank);
+    stripWrap.setAttribute('aria-valuetext', counts + (left ? ', ' + left : ''));
+    progressLabel.textContent = 'Transfer ' + id + ' — ' + counts + ' · ' + framesSeen + ' frames seen' +
+      (left ? ' · ' + left : '');
+    drawStrip(have, pending);
     setStatus(decoded === k ? 'All chunks decoded.' : 'Receiving… every new frame helps, none needs to be caught twice.');
   },
   onComplete({ payload, file, id, seconds }) {
@@ -14636,6 +14666,84 @@ async function selfTest() {
     reasm.reset();
     setStatus('');
     rows.push(['upload: an error survives the batch summary', ok, detail]);
+  }
+
+  // receive progress must count repair equations, not only decoded chunks: after a
+  // partial systematic pass plus a few dense repair frames, decoded stays flat while
+  // rank grows, and the strip, aria value and label must all move with decoded + rank
+  {
+    let ok = false, detail = '';
+    try {
+      reasm.reset();
+      const st = makeFountainState('A'.repeat(137 * CHUNK - 40), CHUNK);
+      st.baseSeed = 0x5EED0004;                       // deterministic repair frames — test-only override
+      for (let c = 0; c < 10; c++) reasm.ingest(fountainFrameText(st, c), 'upload');
+      for (let c = st.k; c < st.k + 5; c++) reasm.ingest(fountainFrameText(st, c), 'upload');
+      const dec = reasm.transfers.get(st.id).dec;
+      const pivots = [...dec.rows.keys()];
+      if (dec.decoded !== 10 || dec.rank !== 5) throw new Error('setup: decoded ' + dec.decoded + ', rank ' + dec.rank);
+      const need = st.k - dec.decoded - dec.rank;
+      const wantLeft = 'about ' + need + ' more frames needed';
+      const now = stripWrap.getAttribute('aria-valuenow');
+      const vtext = stripWrap.getAttribute('aria-valuetext') || '';
+      const label = progressLabel.textContent;
+      // canvas cell colours: decoded = --ink, covered by a repair equation = --strip-pending, else --line
+      const rgbOf = (css) => {
+        const c = document.createElement('canvas'); c.width = c.height = 1;
+        const x = c.getContext('2d'); x.fillStyle = css; x.fillRect(0, 0, 1, 1);
+        return Array.from(x.getImageData(0, 0, 1, 1).data.slice(0, 3)).join(',');
+      };
+      const root = getComputedStyle(document.documentElement);
+      const [ink, muted, line] = ['--ink', '--strip-pending', '--line'].map((v) => rgbOf(root.getPropertyValue(v).trim()));
+      const sctx = stripCanvas.getContext('2d');
+      const cellRgb = (i) => Array.from(sctx.getImageData(Math.floor(i * stripCanvas.width / st.k) + 1, 7, 1, 1).data.slice(0, 3)).join(',');
+      const other = [...Array(st.k).keys()].find((i) => i >= 10 && !pivots.includes(i));
+      const fails = [];
+      if (now !== String(dec.decoded + dec.rank)) fails.push('aria-valuenow ' + now);
+      if (!vtext.includes(wantLeft)) fails.push('aria-valuetext "' + vtext + '"');
+      if (!label.includes(wantLeft)) fails.push('label "' + label + '"');
+      if (![0, 9].every((i) => cellRgb(i) === ink)) fails.push('decoded cell not --ink');
+      if (!pivots.every((i) => cellRgb(i) === muted)) fails.push('equation cells ' + pivots.map(cellRgb).join(' ') + ' not --strip-pending ' + muted);
+      if (cellRgb(other) !== line) fails.push('empty cell not --line');
+      // narrow cells: a pixel column covering chunks 0 (pending) and 1 (decoded) is half ink
+      // (bottom), half grey (top)
+      const kBig = 1400, haveBig = new Array(kBig).fill(false);
+      haveBig[1] = true;
+      drawStrip(haveBig, [0]);
+      const at = (x, y) => Array.from(sctx.getImageData(x, y, 1, 1).data.slice(0, 3)).join(',');
+      if (at(0, 11) !== ink || at(0, 2) !== muted) fails.push('k=1400 shared column ' + at(0, 11) + ' / ' + at(0, 2) + ' (want ink below, grey above)');
+      // large k: the filled share tracks (decoded + rank) / k, so the strip moves in the repair phase
+      const kHuge = 3000, haveHuge = [...Array(kHuge).keys()].map((i) => i % 10 !== 0);   // 90 % decoded
+      const missing = [...Array(kHuge).keys()].filter((i) => i % 10 === 0);
+      const filled = () => {
+        const d = sctx.getImageData(0, 0, stripCanvas.width, stripCanvas.height).data;
+        let f = 0;
+        for (let i = 0; i < d.length; i += 4) if (d[i] + ',' + d[i + 1] + ',' + d[i + 2] !== line) f++;
+        return f / (d.length / 4);
+      };
+      drawStrip(haveHuge, []);
+      const f0 = filled();
+      drawStrip(haveHuge, missing.slice(0, 150));      // + 150 repair equations: 95 %
+      const f1 = filled();
+      if (Math.abs(f0 - 0.90) > 0.02 || Math.abs(f1 - 0.95) > 0.02) {
+        fails.push('k=3000 filled share ' + f0.toFixed(3) + ' → ' + f1.toFixed(3) + ' (want 0.90 → 0.95)');
+      }
+      // label edge cases, straight through the handler: singular forms, nothing left at completion,
+      // and the per-frame estimate stays out of the live status region
+      reasm.onProgress({ id: 'edge', decoded: 135, rank: 1, k: 137, have: new Array(137).fill(false), pending: [136], framesSeen: 3 });
+      const one = progressLabel.textContent;
+      if (!one.includes('+ 1 repair equation ·') || !one.includes('about 1 more frame needed')) fails.push('singular "' + one + '"');
+      if (/more frame/.test(rxStatus.textContent)) fails.push('estimate in live status "' + rxStatus.textContent + '"');
+      reasm.onProgress({ id: 'edge', decoded: 137, rank: 0, k: 137, have: new Array(137).fill(true), pending: [], framesSeen: 4 });
+      const doneText = progressLabel.textContent + ' | ' + stripWrap.getAttribute('aria-valuetext');
+      if (/more frame|repair equation/.test(doneText)) fails.push('complete "' + doneText + '"');
+      ok = fails.length === 0;
+      detail = ok ? label : fails.join(' · ');
+    } catch (e) { detail = e.message; }
+    reasm.reset();
+    stripWrap.hidden = true;
+    setStatus('');
+    rows.push(['progress: strip, aria value and label count repair equations', ok, detail]);
   }
 
   const allPass = rows.every((r) => r[1]);
