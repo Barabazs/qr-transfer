@@ -15260,6 +15260,117 @@ async function selfTest() {
     rows.push(['gzip: Send tab sends the compressed container; the newest Generate wins', ok, detail]);
   }
 
+  // camera loop: decodes only when a new video frame is presented (requestVideoFrameCallback),
+  // and jsQR reads only the centre square of the frame. Feeds the real <video> from a canvas
+  // stream and stands in for requestVideoFrameCallback so the test decides when frames arrive.
+  {
+    let ok = false, detail = '';
+    const W = 1280, H = 720, TEXT = 'qr-transfer camera self-test';
+    const realJsQR = window.jsQR, savedDetector = detector;
+    const calls = [], pending = [];
+    let cs = null;
+    const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+    try {
+      const qr = renderFrame(TEXT, 0, 'M', 4);
+      const src = document.createElement('canvas');
+      src.width = W; src.height = H;
+      const sctx = src.getContext('2d');
+      sctx.fillStyle = '#777'; sctx.fillRect(0, 0, W, H);
+      const qx = Math.round((W - qr.width) / 2), qy = Math.round((H - qr.height) / 2);
+      sctx.drawImage(qr, qx, qy);
+      cs = src.captureStream(0);
+      video.srcObject = cs;
+      await video.play().catch(() => {});
+      for (let i = 0; i < 100 && !(video.readyState >= video.HAVE_ENOUGH_DATA && video.videoWidth); i++) {
+        cs.getVideoTracks()[0].requestFrame();
+        await tick(50);
+      }
+      if (video.videoWidth !== W) throw new Error('test video not ready (readyState ' + video.readyState + ', width ' + video.videoWidth + ')');
+      video.requestVideoFrameCallback = (cb) => { pending.push(cb); return pending.length; };
+      window.jsQR = (data, w, h, opts) => { const r = realJsQR(data, w, h, opts); calls.push([w, h, r && r.data]); return r; };
+      detector = null;
+      stream = cs;
+      scanCtx = scanCanvas.getContext('2d', { willReadFrequently: true });
+      scanLoop(++scanEpoch);
+      await tick(300);                                   // no frame presented yet
+      if (calls.length) throw new Error(calls.length + ' decodes in 300 ms with no new video frame');
+      for (let i = 0; i < 3; i++) {                      // present three frames
+        const cb = pending.shift();
+        if (!cb) throw new Error('loop did not wait for frame ' + (i + 1));
+        cb(performance.now(), {});
+        await tick(50);
+      }
+      if (calls.length !== 3) throw new Error(calls.length + ' decodes for 3 presented frames');
+      const sq = Math.min(W, H);
+      const bad = calls.find(([w, h, d]) => w !== sq || h !== sq || d !== TEXT);
+      if (bad) throw new Error('decode saw ' + bad[0] + '×' + bad[1] + ' → ' + bad[2] + ' (want ' + sq + '×' + sq + ' → text)');
+      // overlay corners are drawn in full-frame coordinates (crop offset added back)
+      const a = overlay.getContext('2d').getImageData(qx + 4 * QUIET - 6, qy + 4 * QUIET - 6, 13, 13).data;
+      let painted = false;
+      for (let i = 3; i < a.length; i += 4) if (a[i]) painted = true;
+      if (!painted) throw new Error('no outline at the QR\'s top-left corner');
+      // restart (second run): the first loop's pending frame callback must not decode
+      scanLoop(++scanEpoch);
+      await tick(0);
+      for (const cb of pending.splice(0)) cb(performance.now(), {});
+      await tick(50);
+      if (calls.length !== 4) throw new Error(calls.length - 3 + ' decodes for 1 frame after a restart (want 1)');
+      ok = true;
+      detail = '0 decodes while idle · 3 decodes for 3 frames, each ' + sq + '×' + sq + ' · 1 after a restart';
+    } catch (e) { detail = e.message; }
+    scanEpoch++;
+    stream = null;
+    delete video.requestVideoFrameCallback;
+    window.jsQR = realJsQR;
+    detector = savedDetector;
+    cs?.getTracks().forEach((t) => t.stop());
+    video.srcObject = null;
+    overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
+    rows.push(['camera loop: one centre-square decode per new video frame', ok, detail]);
+  }
+
+  // camera loop timer fallback: without requestVideoFrameCallback the loop must still decode
+  {
+    let ok = false, detail = '';
+    const W = 640, H = 480;
+    const realJsQR = window.jsQR, savedDetector = detector;
+    let n = 0, cs = null;
+    const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+    try {
+      const src = document.createElement('canvas');
+      src.width = W; src.height = H;
+      src.getContext('2d').fillStyle = '#777';
+      src.getContext('2d').fillRect(0, 0, W, H);
+      cs = src.captureStream(0);
+      video.srcObject = cs;
+      await video.play().catch(() => {});
+      for (let i = 0; i < 100 && !(video.readyState >= video.HAVE_ENOUGH_DATA && video.videoWidth); i++) {
+        cs.getVideoTracks()[0].requestFrame();
+        await tick(50);
+      }
+      if (video.videoWidth !== W) throw new Error('test video not ready (readyState ' + video.readyState + ', width ' + video.videoWidth + ')');
+      video.requestVideoFrameCallback = undefined;
+      window.jsQR = (data, w, h, opts) => { n++; return realJsQR(data, w, h, opts); };
+      detector = null;
+      stream = cs;
+      scanCtx = scanCanvas.getContext('2d', { willReadFrequently: true });
+      scanLoop(++scanEpoch);
+      await tick(400);
+      if (n < 3) throw new Error(n + ' decodes in 400 ms without requestVideoFrameCallback (want at least 3)');
+      ok = true;
+      detail = n + ' decodes in 400 ms on the timer fallback';
+    } catch (e) { detail = e.message; }
+    scanEpoch++;
+    stream = null;
+    delete video.requestVideoFrameCallback;
+    window.jsQR = realJsQR;
+    detector = savedDetector;
+    cs?.getTracks().forEach((t) => t.stop());
+    video.srcObject = null;
+    overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
+    rows.push(['camera loop: timer fallback decodes without requestVideoFrameCallback', ok, detail]);
+  }
+
   clearInterval(keepAlive);
   const allPass = rows.every((r) => r[1]);
   box.innerHTML = '<span class="eyebrow">Self-test — full optical round trip (encode → render → jsQR → fountain-decode)</span>' +
