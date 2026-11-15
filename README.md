@@ -26,22 +26,30 @@ Ethereum Swarm.
   checks the container's CRC-32; a mismatch is reported as corrupt and the transfer starts
   over. Downloads keep the sender's filename (path characters replaced); only a nameless
   payload falls back to `qr-transfer-<id>.<ext>`.
+- **Compression**: before wrapping, a body of 768 B or more is gzip-compressed with the
+  browser's built-in `CompressionStream` (computed locally, no network) and sent that way
+  only if it saves more than 64 B: a big win on text, CSV, JSON or SVG, none on photos,
+  video or archives. Bit 0 of the container's flags byte marks a gzip body, and the CRC-32
+  covers the compressed bytes as sent. The receiver decompresses after the CRC-32 check;
+  gzip's own CRC-32 then checks the result, and output over 64 MB is refused.
 
 ## Usage
 
 Open `index.html` — from disk, `python3 -m http.server`, or a Swarm gateway. The camera
 requires a secure context: HTTPS gateways and `localhost` work, and `file://` works in
 most desktop browsers; plain `http://<lan-ip>` does not (use the image-upload path
-there).
+there). Receiving a compressed transfer needs the Compression Streams API (Chrome 80,
+Firefox 113, Safari 16.4 or newer); an older receiver says so instead of showing the file,
+and an older sender just sends uncompressed.
 
-Practical pacing at the defaults (500 B chunks, 8 fps): a 50 KB file is ~103 chunks ≈
-13 s for the systematic pass, then repair frames for whatever was missed. Frames
-shown ≈ one pass ÷ the fraction the camera catches, plus about 2: one pass + ~6 % at
-5 % frame loss, + ~25 % at 20 %, + ~68 % at 40 %, regardless of *which* frames were
-dropped. The page warns above 100 KB to send (the file plus its container header), and
-again above 500 KB. Transfers are hard-capped at 9,999 chunks — the frame
-format's limit (≈ 4.77 MB of file at the default 500 B frame size). Frame
-formats are hard cutovers. Earlier codes are no longer read: sequential `QRX` frames,
+Practical pacing at the defaults (500 B chunks, 8 fps): a 50 KB incompressible file (a
+photo, say) is ~103 chunks ≈ 13 s for the systematic pass, then repair frames for whatever
+was missed. Frames shown ≈ one pass ÷ the fraction the camera catches, plus about 2: one
+pass + ~6 % at 5 % frame loss, + ~25 % at 20 %, + ~68 % at 40 %, regardless of *which*
+frames were dropped. The page warns above 100 KB to send (the file, gzip-compressed if
+that helps, plus its container header), and again above 500 KB. Transfers are hard-capped
+at 9,999 chunks — the frame format's limit (≈ 4.77 MB of file at the default 500 B frame
+size). Frame formats are hard cutovers. Earlier codes are no longer read: sequential `QRX` frames,
 `QRF` and `QRG` fountain frames, `QRC` fountain frames and single codes (base64 bodies),
 including previously exported frame PNGs, and pre-container single codes (bare base64
 or data URI). The camera skips them silently;
@@ -66,9 +74,11 @@ gone.
 
 **How much can I send?** One QR code holds a container of up to 2,254 bytes (about 2.2 KB
 of file, minus its name and type). Past that, files stream in up to 9,999 chunks:
-roughly 1.9, 4.77 or 7.6 MB at 200, 500 or 800-byte frames. Anything over 100 KB gets
-a warning. Small transfers stay pleasant; multi-hundred-KB ones mean minutes of holding
-the phone still.
+roughly 1.9, 4.77 or 7.6 MB at 200, 500 or 800-byte frames. Anything over 100 KB to send
+(after any compression) gets a warning. Small transfers stay pleasant; multi-hundred-KB
+ones mean minutes of holding the phone still. Text, CSV, JSON and other compressible files
+are gzip-compressed first and often shrink several-fold (20 KB of repetitive text can fit
+one code); photos, video and archives are already compressed and go as they are.
 
 **Can a normal scanner app read the codes?** No. Every code, even a single one, is a
 `QRD|` frame carrying a Base45 container. Use this app to read them.
@@ -78,7 +88,8 @@ any one of them can fill any gap, so a dropped frame costs seconds, not another 
 through the whole sequence.
 
 **Is the transfer verified?** Yes, against accidental damage. The file travels in a
-container with a CRC-32 over its name, type, size and bytes. The receiver checks it
+container with a CRC-32 over its name, type, size and bytes as sent (a compressed body is
+checked again by gzip's own CRC-32 after decompression). The receiver checks it
 before offering the result, and a mismatch restarts the transfer. CRC-32 catches
 misreads, not deliberate tampering: it is not a cryptographic hash.
 
