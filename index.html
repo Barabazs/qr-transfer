@@ -13753,7 +13753,7 @@ class TransferReceiver {
     t.dec.addFrame(f.seedStr, block);
     this.onProgress({
       id: f.id, decoded: t.dec.decoded, rank: t.dec.rank, k: t.dec.k,
-      have: t.dec.chunks.map(Boolean), framesSeen: t.framesSeen,
+      have: t.dec.chunks.map(Boolean), pending: [...t.dec.rows.keys()], framesSeen: t.framesSeen,
     });
     if (t.dec.decoded === t.dec.k) {
       let payload = null, file = null;
@@ -13979,7 +13979,11 @@ const copyResultBtn = $('copy-result');
 let downloadUrl = null;
 let resultDecodedText = null;
 
-function drawStrip(have) {
+// have[i]: chunk i decoded (--ink). pending: pivot chunk of each held repair equation,
+// never a decoded chunk, one per equation (--muted), so the filled share of the strip
+// is (decoded + rank) / k. Pending cells are drawn first so a shared pixel (k > 700)
+// shows ink when any of its chunks is decoded.
+function drawStrip(have, pending) {
   const n = have.length;
   const W = 700, H = 14;
   stripCanvas.width = W;
@@ -13988,10 +13992,13 @@ function drawStrip(have) {
   const css = getComputedStyle(document.documentElement);
   ctx.fillStyle = css.getPropertyValue('--line').trim();
   ctx.fillRect(0, 0, W, H);
-  ctx.fillStyle = css.getPropertyValue('--ink').trim();
   const cell = W / n;
+  const w = Math.max(1, Math.ceil(cell) - (cell > 3 ? 1 : 0));
+  ctx.fillStyle = css.getPropertyValue('--muted').trim();
+  for (const i of pending) ctx.fillRect(Math.floor(i * cell), 0, w, H);
+  ctx.fillStyle = css.getPropertyValue('--ink').trim();
   for (let i = 0; i < n; i++) {
-    if (have[i]) ctx.fillRect(Math.floor(i * cell), 0, Math.max(1, Math.ceil(cell) - (cell > 3 ? 1 : 0)), H);
+    if (have[i]) ctx.fillRect(Math.floor(i * cell), 0, w, H);
   }
 }
 
@@ -14021,14 +14028,20 @@ function safeFileName(name) {
 }
 
 const reasm = new TransferReceiver({
-  onProgress({ id, decoded, rank, k, have, framesSeen }) {
+  onProgress({ id, decoded, rank, k, have, pending, framesSeen }) {
+    // decoded chunks and held repair equations are both independent equations; k of them
+    // finish the transfer, and almost every new repair frame adds one
+    const need = k - decoded - rank;
+    const counts = decoded + ' of ' + k + ' chunks' +
+      (rank ? ' + ' + rank + ' repair equation' + (rank === 1 ? '' : 's') : '');
+    const left = need > 0 ? 'about ' + need + ' more frame' + (need === 1 ? '' : 's') + ' needed' : '';
     stripWrap.hidden = false;
     stripWrap.setAttribute('aria-valuemax', k);
-    stripWrap.setAttribute('aria-valuenow', decoded);
-    stripWrap.setAttribute('aria-valuetext', decoded + ' of ' + k + ' chunks');
-    progressLabel.textContent = 'Transfer ' + id + ' — ' + decoded + ' of ' + k + ' chunks' +
-      (rank ? ' + ' + rank + ' repair equations' : '') + ' · ' + framesSeen + ' frames seen';
-    drawStrip(have);
+    stripWrap.setAttribute('aria-valuenow', decoded + rank);
+    stripWrap.setAttribute('aria-valuetext', counts + (left ? ', ' + left : ''));
+    progressLabel.textContent = 'Transfer ' + id + ' — ' + counts + ' · ' + framesSeen + ' frames seen' +
+      (left ? ' · ' + left : '');
+    drawStrip(have, pending);
     setStatus(decoded === k ? 'All chunks decoded.' : 'Receiving… every new frame helps, none needs to be caught twice.');
   },
   onComplete({ payload, file, id, seconds }) {
@@ -14636,6 +14649,58 @@ async function selfTest() {
     reasm.reset();
     setStatus('');
     rows.push(['upload: an error survives the batch summary', ok, detail]);
+  }
+
+  // receive progress must count repair equations, not only decoded chunks: after a
+  // partial systematic pass plus a few dense repair frames, decoded stays flat while
+  // rank grows, and the strip, aria value and label must all move with decoded + rank
+  {
+    let ok = false, detail = '';
+    try {
+      reasm.reset();
+      const st = makeFountainState('A'.repeat(137 * CHUNK - 40), CHUNK);
+      st.baseSeed = 0x5EED0004;                       // deterministic repair frames — test-only override
+      for (let c = 0; c < 10; c++) reasm.ingest(fountainFrameText(st, c), 'upload');
+      for (let c = st.k; c < st.k + 5; c++) reasm.ingest(fountainFrameText(st, c), 'upload');
+      const dec = reasm.transfers.get(st.id).dec;
+      const pivots = [...dec.rows.keys()];
+      if (dec.decoded !== 10 || dec.rank !== 5) throw new Error('setup: decoded ' + dec.decoded + ', rank ' + dec.rank);
+      const need = st.k - dec.decoded - dec.rank;
+      const wantLeft = 'about ' + need + ' more frames needed';
+      const now = stripWrap.getAttribute('aria-valuenow');
+      const vtext = stripWrap.getAttribute('aria-valuetext') || '';
+      const label = progressLabel.textContent;
+      // canvas cell colours: decoded = --ink, covered by a repair equation = --muted, else --line
+      const rgbOf = (css) => {
+        const c = document.createElement('canvas'); c.width = c.height = 1;
+        const x = c.getContext('2d'); x.fillStyle = css; x.fillRect(0, 0, 1, 1);
+        return Array.from(x.getImageData(0, 0, 1, 1).data.slice(0, 3)).join(',');
+      };
+      const root = getComputedStyle(document.documentElement);
+      const [ink, muted, line] = ['--ink', '--muted', '--line'].map((v) => rgbOf(root.getPropertyValue(v).trim()));
+      const sctx = stripCanvas.getContext('2d');
+      const cellRgb = (i) => Array.from(sctx.getImageData(Math.floor(i * stripCanvas.width / st.k) + 1, 7, 1, 1).data.slice(0, 3)).join(',');
+      const other = [...Array(st.k).keys()].find((i) => i >= 10 && !pivots.includes(i));
+      const fails = [];
+      if (now !== String(dec.decoded + dec.rank)) fails.push('aria-valuenow ' + now);
+      if (!vtext.includes(wantLeft)) fails.push('aria-valuetext "' + vtext + '"');
+      if (!label.includes(wantLeft)) fails.push('label "' + label + '"');
+      if (![0, 9].every((i) => cellRgb(i) === ink)) fails.push('decoded cell not --ink');
+      if (!pivots.every((i) => cellRgb(i) === muted)) fails.push('equation cells ' + pivots.map(cellRgb).join(' ') + ' not --muted ' + muted);
+      if (cellRgb(other) !== line) fails.push('empty cell not --line');
+      // k > 700: one pixel covers several chunks; a decoded chunk must win over a pending one
+      const kBig = 1400, haveBig = new Array(kBig).fill(false);
+      haveBig[1] = true;                              // chunk 1 decoded, chunk 0 pending: same pixel (cell = 0.5)
+      drawStrip(haveBig, [0]);
+      const px = Array.from(sctx.getImageData(0, 7, 1, 1).data.slice(0, 3)).join(',');
+      if (px !== ink) fails.push('k>700 shared pixel ' + px + ' not --ink ' + ink);
+      ok = fails.length === 0;
+      detail = ok ? label : fails.join(' · ');
+    } catch (e) { detail = e.message; }
+    reasm.reset();
+    stripWrap.hidden = true;
+    setStatus('');
+    rows.push(['progress: strip, aria value and label count repair equations', ok, detail]);
   }
 
   const allPass = rows.every((r) => r[1]);
