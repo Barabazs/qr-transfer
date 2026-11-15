@@ -13544,6 +13544,11 @@ $('next').addEventListener('click', () => {
   drawFountainFrame(anim.counter + 1);
 });
 
+// exported PNG name, e.g. qrc-chunk-0001of9.png; follows FRAME_TAG so names never lag a cutover
+function exportFileName(i, total) {
+  return FRAME_TAG.toLowerCase() + '-chunk-' + String(i + 1).padStart(4, '0') + 'of' + total + '.png';
+}
+
 // exports the systematic pass only — those k frames are the complete payload
 $('export').addEventListener('click', async () => {
   if (!anim) return;
@@ -13562,7 +13567,7 @@ $('export').addEventListener('click', async () => {
     }
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'qrg-chunk-' + String(i + 1).padStart(4, '0') + 'of' + total + '.png';
+    a.download = exportFileName(i, total);
     a.click();
     URL.revokeObjectURL(a.href);
     await new Promise((r) => setTimeout(r, 60)); // avoid download-storm blocking
@@ -14572,6 +14577,13 @@ async function selfTest() {
     }
     const nonImage = scanImageMetadata(new TextEncoder().encode('hello, not an image'));
     rows.push(['metadata scan: non-image bytes → null', nonImage === null, String(nonImage)]);
+  }
+
+  {
+    const got = [exportFileName(0, 9), exportFileName(136, 137)];
+    const want = ['qrc-chunk-0001of9.png', 'qrc-chunk-0137of137.png'];
+    const ok = got.every((g, i) => g === want[i]);
+    rows.push(['export frame names follow the frame tag', ok, got.join(', ')]);
   }
 
   const allPass = rows.every((r) => r[1]);
