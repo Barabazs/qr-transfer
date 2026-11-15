@@ -15295,9 +15295,14 @@ async function selfTest() {
     const W = 1280, H = 720, TEXT = 'qr-transfer camera self-test';
     const realJsQR = window.jsQR, savedDetector = detector;
     const calls = [], pending = [];
-    let cs = null;
+    let cs = null, sizeSets = 0;
     const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+    const canvasProto = Object.getOwnPropertyDescriptors(HTMLCanvasElement.prototype);
     try {
+      for (const k of ['width', 'height']) {             // count scan-canvas resizes
+        Object.defineProperty(scanCanvas, k, { configurable: true, get() { return canvasProto[k].get.call(this); },
+          set(v) { sizeSets++; canvasProto[k].set.call(this, v); } });
+      }
       const qr = renderFrame(TEXT, 0, 'M', 4);
       const src = document.createElement('canvas');
       src.width = W; src.height = H;
@@ -15314,7 +15319,8 @@ async function selfTest() {
       }
       if (video.videoWidth !== W) throw new Error('test video not ready (readyState ' + video.readyState + ', width ' + video.videoWidth + ')');
       video.requestVideoFrameCallback = (cb) => { pending.push(cb); return pending.length; };
-      window.jsQR = (data, w, h, opts) => { const r = realJsQR(data, w, h, opts); calls.push([w, h, r && r.data]); return r; };
+      // pending.length at decode time: 1 when the next frame wait was armed before decoding
+      window.jsQR = (data, w, h, opts) => { const r = realJsQR(data, w, h, opts); calls.push([w, h, r && r.data, pending.length]); return r; };
       detector = null;
       stream = cs;
       scanCtx = scanCanvas.getContext('2d', { willReadFrequently: true });
@@ -15336,17 +15342,44 @@ async function selfTest() {
       let painted = false;
       for (let i = 3; i < a.length; i += 4) if (a[i]) painted = true;
       if (!painted) throw new Error('no outline at the QR\'s top-left corner');
+      if (calls.some((c) => c[3] !== 1)) throw new Error('next frame wait armed after decoding (pending during decodes: ' + calls.map((c) => c[3]).join(',') + ')');
+      if (sizeSets > 2) throw new Error('scan canvas resized ' + sizeSets + ' times for 3 same-size frames');
+      // guide = the jsQR crop: white dash on a dark under-stroke along the centre square's edges
+      const sx = (W - sq) / 2;
+      const octx = overlay.getContext('2d');
+      const column = (x) => octx.getImageData(x, (H - sq) / 2 + 20, 1, sq - 40).data;   // vertical edges only
+      const has = (d, f) => { for (let i = 0; i < d.length; i += 4) if (f(d[i], d[i + 1], d[i + 2], d[i + 3])) return true; return false; };
+      const white = has(column(sx + 1), (r, g, b, al) => al > 150 && r > 200 && g > 200 && b > 200);
+      const dark = has(column(sx - 1), (r, g, b, al) => al > 60 && r < 40 && g < 40 && b < 40);
+      const stray = [2, sx - 20, W - sx + 20, W - 3].some((x) => has(column(x), (r, g, b, al) => al > 0));
+      if (!white || !dark || stray) throw new Error('guide: white dash at the crop edge ' + white + ', dark under-stroke ' + dark + ', paint outside it ' + stray);
       // restart (second run): the first loop's pending frame callback must not decode
       scanLoop(++scanEpoch);
       await tick(0);
       for (const cb of pending.splice(0)) cb(performance.now(), {});
       await tick(50);
       if (calls.length !== 4) throw new Error(calls.length - 3 + ' decodes for 1 frame after a restart (want 1)');
+      // BarcodeDetector path: the whole frame goes to detect(), its corners are drawn as given,
+      // jsQR isn't called and there's no guide (the detector sees the full frame)
+      const seen = [], pts = [{ x: 100, y: 100 }, { x: 200, y: 100 }, { x: 200, y: 200 }, { x: 100, y: 200 }];
+      detector = { detect: async (src) => { seen.push(src); return [{ rawValue: TEXT, cornerPoints: pts }]; } };
+      for (const cb of pending.splice(0)) cb(performance.now(), {});
+      await tick(50);
+      const oc = overlay.getContext('2d');
+      const near = (x, y) => { const d = oc.getImageData(x - 3, y - 3, 7, 7).data; for (let i = 3; i < d.length; i += 4) if (d[i]) return true; return false; };
+      const guideGone = !near((W - sq) / 2 - 1, H / 2) && !near((W - sq) / 2 - 1, (H - sq) / 2 + 6);
+      if (seen.length !== 1 || seen[0] !== video || calls.length !== 4 || !near(100, 100) || !near(200, 200) || !guideGone) {
+        throw new Error('detector path: detect calls ' + seen.length + (seen[0] === video ? ' (video)' : ' (not the video)') +
+          ', jsQR calls ' + (calls.length - 4) + ', corners drawn ' + (near(100, 100) && near(200, 200)) + ', guide hidden ' + guideGone);
+      }
       ok = true;
-      detail = '0 decodes while idle · 3 decodes for 3 frames, each ' + sq + '×' + sq + ' · 1 after a restart';
+      detail = '0 decodes while idle · 3 decodes for 3 frames, each ' + sq + '×' + sq + ', next wait armed first · guide on the crop edge · ' +
+        '1 after a restart · detector gets the full frame';
     } catch (e) { detail = e.message; }
     scanEpoch++;
     stream = null;
+    delete scanCanvas.width;
+    delete scanCanvas.height;
     delete video.requestVideoFrameCallback;
     window.jsQR = realJsQR;
     detector = savedDetector;
