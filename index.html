@@ -13264,17 +13264,17 @@ async function packFile(file) {
 }
 // decoded container -> file with its body inflated (gzip stays true for the UI);
 // throws an Error whose message is shown to the user
-async function unpackFile(file) {
+async function unpackFile(file, maxOut = GUNZIP_MAX) {
   if (!file.gzip) return file;
   if (typeof DecompressionStream !== 'function') {
     throw new Error('This transfer is gzip-compressed, and this browser cannot decompress it ' +
       '(it needs Chrome 80, Firefox 113 or Safari 16.4 or newer).');
   }
   let bytes;
-  try { bytes = await gunzipBytes(file.bytes, GUNZIP_MAX); } catch {
+  try { bytes = await gunzipBytes(file.bytes, maxOut); } catch {
     throw new Error('The transfer passed its checksum but is not valid gzip — the sender may be faulty.');
   }
-  if (bytes === null) throw new Error('The decompressed file would be over ' + fmtBytes(GUNZIP_MAX) + ', so it was refused.');
+  if (bytes === null) throw new Error('The decompressed file would be over ' + fmtBytes(maxOut) + ', so it was refused.');
   return { ...file, bytes };
 }
 
@@ -13513,14 +13513,18 @@ fpsSlider.addEventListener('input', () => {
   updateSendStatsLine();
 });
 
-generateBtn.addEventListener('click', async () => {
+let generateSeq = 0;   // a newer Generate supersedes one still reading or compressing
+async function generateTransfer() {
+  const seq = ++generateSeq;
   stopAnimation();
   generateBtn.disabled = true;
   sendStats.textContent = 'Encoding…';
   try {
     const file = await readSendFile();
+    if (seq !== generateSeq) return;
     if (!pickedFile && file.bytes.length === 0) { sendStats.textContent = 'Nothing to send.'; return; }
     const packed = await packFile(file);
+    if (seq !== generateSeq) return;
     const container = encodeContainer(packed);
     const gzipNote = packed.gzip ? ' · gzip ' + fmtBytes(file.bytes.length) + ' → ' + fmtBytes(packed.bytes.length) : '';
     sendWarn.innerHTML = '';
@@ -13562,6 +13566,7 @@ generateBtn.addEventListener('click', async () => {
     }
     updateSendStatsLine();
   } catch (err) {
+    if (seq !== generateSeq) return;
     sendStats.textContent = '';
     const errSpan = document.createElement('span');
     errSpan.className = 'error';
@@ -13570,7 +13575,8 @@ generateBtn.addEventListener('click', async () => {
   } finally {
     updateGenerateState();
   }
-});
+}
+generateBtn.addEventListener('click', generateTransfer);
 
 function updateSendStatsLine() {
   if (!anim) return;
@@ -13805,6 +13811,7 @@ class TransferReceiver {
     this.done = false;
     this.epoch = 0;               // bumped by reset(); a gzip inflate from an older epoch is dropped
     this.unpacking = null;        // promise of the gzip inflate in flight, else null
+    this.failed = new Set();      // ids of fountain transfers whose gzip body failed to inflate
     this.tick = 0;
     this.onProgress = onProgress || (() => {});
     this.onComplete = onComplete || (() => {});
@@ -13815,10 +13822,13 @@ class TransferReceiver {
     this.done = false;
     this.epoch++;
     this.unpacking = null;
+    this.failed.clear();
   }
   // hand a CRC-checked file to onComplete. A gzip body is inflated first, asynchronously:
   // done stays set meanwhile so nothing else can complete, and a reset() in between drops
-  // the result. If inflating fails the receiver is usable again (a fountain transfer restarts).
+  // the result. If inflating fails the receiver is usable again, but the failed transfer's id
+  // is remembered and its later frames are ignored until Reset: the CRC already passed, so a
+  // rescan would fail the same way, and the error stays on screen instead of a restart.
   // Uncompressed files still complete synchronously, inside ingest.
   deliver(res) {
     this.done = true;
@@ -13829,7 +13839,7 @@ class TransferReceiver {
     }, (e) => {
       if (epoch !== this.epoch) return;
       this.done = false;
-      if (res.id) this.transfers.delete(res.id);
+      if (res.id) { this.transfers.delete(res.id); this.failed.add(res.id); }
       this.onError(e.message);
     }).finally(() => {
       if (epoch === this.epoch) this.unpacking = null;
@@ -13866,6 +13876,7 @@ class TransferReceiver {
     if (!block) return;
     const s = block.length;
     if (f.len > f.k * s || f.len <= (f.k - 1) * s) return;   // inconsistent header
+    if (this.failed.has(f.id)) return;                       // its gzip body already failed
     let t = this.transfers.get(f.id);
     if (!t) {
       if (this.transfers.size >= 4) {
@@ -15101,6 +15112,143 @@ async function selfTest() {
       detail = ok ? r.outs.map((o) => o.file.name).join(' then ') : r.outs.length + ' completions · ' + (r.errs[0] || '');
     } catch (e) { detail = e.message; }
     rows.push(['gzip: two compressed transfers in a row on one receiver', ok, detail]);
+  }
+
+  {
+    let ok = false, detail = '';
+    try {
+      // a gzip failure is deterministic (the CRC already passed): rescanning the same transfer
+      // must not restart it, so the error stays on screen until Reset
+      let progress = 0;
+      const errs = [];
+      const rx = new TransferReceiver({ onProgress: () => { progress++; }, onError: (e) => { errs.push(e); } });
+      const st = makeFountainState(gzipFlagged(new Uint8Array(3000).fill(0x41), 'text/plain', 'bad.txt'), CHUNK);
+      fountainRun(rx, st);
+      await rx.unpacking;
+      const before = progress;
+      fountainRun(rx, st);                              // camera keeps seeing the same sender
+      await rx.unpacking;
+      const ignored = progress === before && rx.transfers.size === 0 && errs.length === 1;
+      rx.reset();
+      fountainRun(rx, st);
+      await rx.unpacking;
+      ok = ignored && progress > before && errs.length === 2;
+      detail = !ignored ? 'rescan restarted the transfer: ' + (progress - before) + ' progress events, ' +
+        rx.transfers.size + ' transfers, ' + errs.length + ' errors' :
+        ok ? 'rescan ignored until Reset; after Reset it is tried again' : 'not retried after Reset';
+    } catch (e) { detail = e.message; }
+    rows.push(['gzip: a failed fountain transfer stays failed until Reset', ok, detail]);
+  }
+  {
+    let ok = false, detail = '';
+    try {
+      const r = recordingReceiver();
+      sendContainer(r.rx, gzipFlagged(new Uint8Array([1, 2, 3]), 'text/plain', 'bad.txt'));
+      const pending = r.rx.unpacking;
+      r.rx.reset();                                     // Reset while the doomed inflate runs
+      await pending;
+      ok = r.errs.length === 0 && !r.rx.done;
+      detail = ok ? 'stale error dropped' : 'errors after Reset: ' + r.errs.join(' | ') + ' · done ' + r.rx.done;
+    } catch (e) { detail = e.message; }
+    rows.push(['gzip: reset while inflating drops a stale error', ok, detail]);
+  }
+  {
+    let ok = false, detail = '';
+    try {
+      // bodies whose gzip saves 1..64 B go as-is; one that saves more goes compressed
+      const rnd = randomBytes(1200);
+      let small = null, big = null;
+      for (let z = 0; z <= 400 && !(small && big); z += 4) {
+        const body = new Uint8Array(rnd.length + z);
+        body.set(rnd);
+        const saving = body.length - (await rawGzip(body)).length;
+        if (!small && saving >= 1 && saving <= 64) small = { body, saving };
+        if (!big && saving > 72) big = { body, saving };
+      }
+      if (!small || !big) throw new Error('no test bodies found');
+      const ps = await packFile({ bytes: small.body, mime: '', name: '' });
+      const pb = await packFile({ bytes: big.body, mime: '', name: '' });
+      ok = !ps.gzip && ps.bytes === small.body && pb.gzip;
+      detail = 'saves ' + small.saving + ' B → ' + (ps.gzip ? 'gzip' : 'as-is') + ' · saves ' + big.saving + ' B → ' + (pb.gzip ? 'gzip' : 'as-is');
+    } catch (e) { detail = e.message; }
+    rows.push(['gzip: a saving of 64 B or less is not worth it', ok, detail]);
+  }
+  {
+    let ok = false, detail = '';
+    const Real = window.DecompressionStream;
+    try {
+      // the cap must stop the inflate while it streams, not after buffering the whole output
+      const bomb = await gzipBytes(new Uint8Array(16 * 1024 * 1024));
+      let pulled = 0;
+      window.DecompressionStream = class {
+        constructor(fmt) {
+          const d = new Real(fmt);
+          this.writable = d.writable;
+          this.readable = d.readable.pipeThrough(new TransformStream({ transform(c, ctl) { pulled += c.length; ctl.enqueue(c); } }));
+        }
+      };
+      const capped = await gunzipBytes(bomb, 1024 * 1024);
+      const seen = pulled;
+      window.DecompressionStream = Real;
+      let refused = '';
+      try { await unpackFile({ bytes: bomb, mime: '', name: '', gzip: true }, 1024 * 1024); } catch (e) { refused = e.message; }
+      ok = capped === null && seen <= 4 * 1024 * 1024 && /over/.test(refused);
+      detail = fmtBytes(bomb.length) + ' of gzip (16 MB inflated) under a 1 MB cap: ' + fmtBytes(seen) + ' inflated before stopping · ' +
+        (refused || 'unpackFile did not refuse');
+    } catch (e) { detail = e.message; } finally { window.DecompressionStream = Real; }
+    rows.push(['gzip: bomb cap stops the inflate early and refuses the file', ok, detail]);
+  }
+  {
+    let ok = false, detail = '';
+    const RealD = window.DecompressionStream, RealC = window.CompressionStream;
+    try {
+      const flagged = decodeContainer(gzipFlagged(await rawGzip(new Uint8Array(1000)), '', ''));
+      window.DecompressionStream = undefined;
+      let msg = '';
+      try { await unpackFile(flagged); } catch (e) { msg = e.message; }
+      window.DecompressionStream = RealD;
+      window.CompressionStream = undefined;
+      const plain = { bytes: new Uint8Array(5000).fill(0x41), mime: '', name: '' };
+      const packed = await packFile(plain);
+      window.CompressionStream = RealC;
+      ok = /cannot decompress/.test(msg) && !packed.gzip && packed.bytes === plain.bytes;
+      detail = 'receiver: ' + (msg || 'no error') + ' · sender: ' + (packed.gzip ? 'gzip' : 'sends as-is');
+    } catch (e) { detail = e.message; } finally { window.DecompressionStream = RealD; window.CompressionStream = RealC; }
+    rows.push(['gzip: browsers without Compression Streams send as-is and explain on receive', ok, detail]);
+  }
+  {
+    let ok = false, detail = '';
+    const savedText = sendText.value;
+    try {
+      // the Send tab: the generated code carries the compressed container, and a slow
+      // first Generate can't overwrite a newer one
+      sendText.value = 'A'.repeat(100000);
+      await generateTransfer();
+      const one = anim && anim.container;
+      const sendsGzip = !!one && one[4] === FLAG_GZIP && sendEncoded.value === bytesToBase64(one) && /gzip/.test(sendStats.textContent);
+      sendText.value = 'A'.repeat(1024 * 1024);
+      const p1 = generateTransfer();                    // slow: 1 MB through gzip
+      await new Promise((r) => setTimeout(r, 0));       // p1 is now compressing
+      sendText.value = 'hello second';
+      const p2 = generateTransfer();                    // fast: under the gzip threshold
+      await Promise.all([p1, p2]);
+      const last = anim && decodeContainer(anim.container);
+      const latest = !!last && new TextDecoder().decode(last.bytes) === 'hello second';
+      ok = sendsGzip && latest;
+      detail = (sendsGzip ? 'Generate sends ' + fmtBytes(one.length) + ' flagged gzip' : 'Generate did not send the gzip container') +
+        ' · after overlapping Generates: ' + (last ? fmtBytes(last.bytes.length) + ' of text' : 'nothing') +
+        (latest ? ' (the newer one)' : ' (stale)');
+    } catch (e) { detail = e.message; } finally {
+      stopAnimation();
+      anim = null;
+      sendText.value = savedText;
+      sendOutput.hidden = true;
+      sendStats.textContent = '';
+      sendWarn.innerHTML = '';
+      sendEncoded.value = '';
+      updateGenerateState();
+    }
+    rows.push(['gzip: Send tab sends the compressed container; the newest Generate wins', ok, detail]);
   }
 
   clearInterval(keepAlive);
