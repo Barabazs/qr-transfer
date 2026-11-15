@@ -13250,8 +13250,9 @@ function parseFrame(str) {
     }
     return { kind: 'invalid' };
   }
-  if (LEGACY_TAGS.some((t) => str.startsWith(t + '|'))) return { kind: 'invalid' };   // pre-cutover frames
-  return { kind: 'foreign' };   // a stray QR, or a pre-cutover bare base64 / data-URI single code
+  // pre-cutover frames, and pre-container single codes for files (data URIs)
+  if (LEGACY_TAGS.some((t) => str.startsWith(t + '|')) || /^data:[^,]*;base64,/.test(str)) return { kind: 'legacy' };
+  return { kind: 'foreign' };   // a stray QR, or a pre-container bare-base64 (typed text) single code
 }
 /* ============================================================
    §3 qrRender
@@ -13687,6 +13688,9 @@ function isSingleBit(row) {
   return seen;
 }
 
+const OLD_FORMAT_MSG = 'That QR is from an older version of qr-transfer, which this page no longer reads — ' +
+  'export it again from a sender running this version.';
+
 class TransferReceiver {
   constructor({ onProgress, onComplete, onError }) {
     this.transfers = new Map();   // id -> {dec, framesSeen, lastAt}
@@ -13710,6 +13714,11 @@ class TransferReceiver {
     if (this.done || typeof str !== 'string' || str.length === 0) return;
     const f = parseFrame(str);
     if (f.kind === 'invalid') return;
+    if (f.kind === 'legacy') {
+      // silent on camera (an old tab nearby must not spam errors); explained on upload
+      if (source === 'upload') this.onError(OLD_FORMAT_MSG);
+      return;
+    }
     if (f.kind === 'single' || f.kind === 'foreign') {
       // stray-QR guard: a random background QR must not hijack a camera session
       const file = f.kind === 'single' ? payloadToFile(f.body) : null;
@@ -13934,10 +13943,12 @@ function decodeBitmap(bmp, maxDim) {
   const img = ctx.getImageData(0, 0, c.width, c.height);
   return jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
 }
+let uploadBatch = null;   // {error} while ingestFiles runs, so its summary can keep the error
 async function ingestFiles(fileList) {
   const files = Array.from(fileList || []);
   if (!files.length) return;
   let decoded = 0, failed = 0;
+  const batch = uploadBatch = { error: null };
   for (const file of files) {
     if (reasm.done) break;
     try {
@@ -13949,9 +13960,12 @@ async function ingestFiles(fileList) {
       else failed++;
     } catch { failed++; }
   }
+  if (uploadBatch === batch) uploadBatch = null;
   if (!reasm.done) {
-    setStatus(decoded + ' of ' + files.length + ' image' + (files.length > 1 ? 's' : '') + ' decoded' +
-      (failed ? ' — ' + failed + ' had no readable QR (screenshots work better than photos).' : '.'), failed > 0 && !decoded);
+    const summary = decoded + ' of ' + files.length + ' image' + (files.length > 1 ? 's' : '') + ' decoded' +
+      (failed ? ' — ' + failed + ' had no readable QR (screenshots work better than photos).' : '.');
+    if (batch.error) setStatus(summary + ' ' + batch.error, true);
+    else setStatus(summary, failed > 0 && !decoded);
   }
 }
 
@@ -14023,6 +14037,7 @@ const reasm = new TransferReceiver({
     showResult(payload, file, id, seconds);
   },
   onError(msg) {
+    if (uploadBatch) uploadBatch.error = msg;
     setStatus(msg, true);
   },
 });
@@ -14230,8 +14245,10 @@ async function selfTest() {
         onError: (e) => { err = e; },
       });
       const delivered = () => !!out && out.payload === payload && sameFile(out.file, file);
-      // legacy v1 frames must be ignored, not treated as a payload
+      // legacy v1 frames must be ignored, not treated as a payload (upload explains why)
       rx.ingest('QRX|deadbeef|1/2|AAAA', 'upload');
+      if (!/older version of qr-transfer/.test(err)) throw new Error('legacy decoy not explained: ' + (err || 'no error'));
+      err = '';
       if (isSingle) {
         rx.ingest(opticalDecode(singleFrameText(payload), 0, 'M'), 'upload');
         ok = delivered();
@@ -14341,22 +14358,27 @@ async function selfTest() {
     rows.push(['repair frames ≈ chunks missed (k=' + k + ', ' + Math.round(loss * 100) + '% systematic loss)', ok, detail]);
   }
 
-  // previous frame formats must be ignored, never ingested as transfer data
+  // previous frame formats must never be ingested: silent on camera, explained on upload
   {
-    const errs = [];
-    const rx4 = new TransferReceiver({ onError: (e) => { errs.push(e); } });
     const legacy = [
       'QRX|deadbeef|1/2|AAAA',                        // v1 sequential frames
       'QRF|deadbeef|3|1200|s0|' + bytesToBase64(new Uint8Array(500)),     // v2 soliton fountain, systematic
       'QRF|deadbeef|3|1200|123456|' + bytesToBase64(new Uint8Array(500)), // v2 soliton fountain, repair
       'QRG|deadbeef|3|1200|s0|' + bytesToBase64(new Uint8Array(500)),     // v3 dense fountain, systematic
       'QRG|deadbeef|3|1200|123456|' + bytesToBase64(new Uint8Array(500)), // v3 dense fountain, repair
+      'data:text/plain;base64,aGk=',                  // pre-container single code (file)
     ];
-    for (const f of legacy) rx4.ingest(f, 'upload');
-    const ok = rx4.transfers.size === 0 && !rx4.done && errs.length === 0;
-    rows.push(['legacy QRX/QRF/QRG frames ignored silently', ok,
-      ok ? legacy.length + ' legacy frames, no state created' :
-        rx4.transfers.size + ' transfers created · ' + errs.length + ' errors']);
+    const camErrs = [], upErrs = [];
+    const rxCam = new TransferReceiver({ onError: (e) => { camErrs.push(e); } });
+    const rxUp = new TransferReceiver({ onError: (e) => { upErrs.push(e); } });
+    for (const f of legacy) { rxCam.ingest(f, 'camera'); rxUp.ingest(f, 'upload'); }
+    const noState = [rxCam, rxUp].every((rx) => rx.transfers.size === 0 && !rx.done);
+    const explained = upErrs.length === legacy.length && upErrs.every((e) => /older version of qr-transfer/.test(e));
+    const ok = noState && camErrs.length === 0 && explained;
+    rows.push(['legacy frames: never ingested, silent on camera, explained on upload', ok,
+      ok ? legacy.length + ' legacy codes, no state; upload says: ' + upErrs[0] :
+        'state ' + (noState ? 'none' : 'created') + ' · camera errors ' + camErrs.length +
+        ' · upload errors ' + upErrs.length + (upErrs[0] ? ' (' + upErrs[0] + ')' : '')]);
   }
 
   // a stray single QR must not hijack a camera session that holds only repair equations
@@ -14584,6 +14606,36 @@ async function selfTest() {
     const want = ['qrc-chunk-0001of9.png', 'qrc-chunk-0137of137.png'];
     const ok = got.every((g, i) => g === want[i]);
     rows.push(['export frame names follow the frame tag', ok, got.join(', ')]);
+  }
+
+  // the upload summary ("N of N images decoded.") must not overwrite an error from the same batch
+  {
+    let ok = false, detail = '';
+    try {
+      const png = async (text, name) => {
+        const blob = await new Promise((r) => renderFrame(text, 0, 'M', 4).toBlob(r, 'image/png'));
+        return new File([blob], name, { type: 'image/png' });
+      };
+      const cases = [
+        ['QRF|deadbeef|3|1200|s0|' + bytesToBase64(new Uint8Array(200)), /older version of qr-transfer/],
+        ['https://example.com/not-a-transfer', /not a transfer from this tool/],
+      ];
+      const seen = [];
+      for (const [text, want] of cases) {
+        reasm.reset();
+        await ingestFiles([await png(text, 'case.png')]);
+        const status = rxStatus.textContent;
+        seen.push(status);
+        if (!want.test(status) || !/1 of 1 image decoded/.test(status) || !rxStatus.querySelector('.error')) {
+          throw new Error('status after upload: "' + status + '"');
+        }
+      }
+      ok = true;
+      detail = seen.join(' / ');
+    } catch (e) { detail = e.message; }
+    reasm.reset();
+    setStatus('');
+    rows.push(['upload: an error survives the batch summary', ok, detail]);
   }
 
   const allPass = rows.every((r) => r[1]);

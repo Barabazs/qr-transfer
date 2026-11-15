@@ -41,7 +41,9 @@ file), and again above 500 KB. Transfers are hard-capped at 9,999 chunks — the
 format's limit (≈ 4.77 MB encoded at the default 500 B frame size). Frame
 formats are hard cutovers. Earlier codes are no longer read: sequential `QRX` frames,
 `QRF` and `QRG` fountain frames (including previously exported frame PNGs) and
-pre-container single codes (bare base64 or data URI). Older copies of this page likewise
+pre-container single codes (bare base64 or data URI). The camera skips them silently;
+uploading one says it comes from an older version (an old typed-text code, being plain
+base64, gets "not a transfer from this tool"). Older copies of this page likewise
 ignore the new `QRC` codes. Sender and receiver must both run this version.
 
 Self-test (full in-memory optical round trip, no camera needed):
