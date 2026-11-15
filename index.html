@@ -13915,7 +13915,7 @@ class TransferReceiver {
 }
 
 /* ============================================================
-   §6 camera — adaptive scan loop, native BarcodeDetector fast path
+   §6 camera — per-frame scan loop, native BarcodeDetector fast path
    ============================================================ */
 const video = $('video'), overlay = $('overlay'), camwrap = $('camwrap');
 const camToggle = $('cam-toggle'), rxStatus = $('rx-status');
@@ -13994,11 +13994,28 @@ function stopCamera() {
   camToggle.textContent = 'Start camera';
   if (!reasm.done) setStatus('Camera is off. Start it, or add QR images below.');
 }
-// scans as fast as decode completes (capped ~40 Hz) instead of a fixed rate
+// Resolves on the next new camera frame. requestVideoFrameCallback fires once per presented
+// frame, so a frame is never decoded twice; without it, fall back to a ~40 Hz timer. The next
+// wait is armed before decoding so a frame presented mid-decode is not missed.
+const SCAN_FALLBACK_INTERVAL = 25;
+function nextVideoFrame() {
+  if (typeof video.requestVideoFrameCallback === 'function') {
+    return new Promise((r) => video.requestVideoFrameCallback(() => r()));
+  }
+  return new Promise((r) => setTimeout(r, SCAN_FALLBACK_INTERVAL));
+}
+// the centred square of a w×h frame: the only region jsQR scans (outlined on the overlay)
+function centreSquare(w, h) {
+  const size = Math.min(w, h);
+  return { sx: Math.floor((w - size) / 2), sy: Math.floor((h - size) / 2), size };
+}
+// one decode per new camera frame, as fast as decode completes
 async function scanLoop(epoch) {
-  const MIN_INTERVAL = 25;
+  let frame = nextVideoFrame();
   while (stream && epoch === scanEpoch) {
-    const t0 = performance.now();
+    await frame;
+    if (!stream || epoch !== scanEpoch) break;   // stopped (or restarted) while waiting
+    frame = nextVideoFrame();                     // armed before decoding
     let text = null, corners = null;
     if (video.readyState >= video.HAVE_ENOUGH_DATA && video.videoWidth) {
       if (overlay.width !== video.videoWidth) {
@@ -14011,22 +14028,34 @@ async function scanLoop(epoch) {
           if (codes[0]) { text = codes[0].rawValue; corners = codes[0].cornerPoints; }
         } catch { detector = null; }   // fall back to jsQR permanently
       }
+      const { sx, sy, size } = centreSquare(video.videoWidth, video.videoHeight);
       if (!detector) {
-        if (scanCanvas.width !== video.videoWidth) {
-          scanCanvas.width = video.videoWidth;
-          scanCanvas.height = video.videoHeight;
+        if (scanCanvas.width !== size || scanCanvas.height !== size) {
+          scanCanvas.width = size;
+          scanCanvas.height = size;
         }
-        scanCtx.drawImage(video, 0, 0);
-        const img = scanCtx.getImageData(0, 0, scanCanvas.width, scanCanvas.height);
+        scanCtx.drawImage(video, sx, sy, size, size, 0, 0, size, size);
+        const img = scanCtx.getImageData(0, 0, size, size);
         const code = jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
         if (code && code.data) {
           text = code.data;
           const L = code.location;
-          corners = [L.topLeftCorner, L.topRightCorner, L.bottomRightCorner, L.bottomLeftCorner];
+          corners = [L.topLeftCorner, L.topRightCorner, L.bottomRightCorner, L.bottomLeftCorner]
+            .map((p) => ({ x: p.x + sx, y: p.y + sy }));   // crop → frame coordinates
         }
       }
       const octx = overlay.getContext('2d');
       octx.clearRect(0, 0, overlay.width, overlay.height);
+      if (!detector) {                 // scan-area guide: jsQR sees nothing outside it
+        octx.setLineDash([12, 8]);
+        octx.strokeStyle = 'rgba(0, 0, 0, 0.5)';   // dark under-stroke: the guide stays visible over a bright screen
+        octx.lineWidth = 4;
+        octx.strokeRect(sx + 1, sy + 1, size - 2, size - 2);
+        octx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+        octx.lineWidth = 2;
+        octx.strokeRect(sx + 1, sy + 1, size - 2, size - 2);
+        octx.setLineDash([]);
+      }
       if (corners) {
         octx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--laser').trim() || '#e02d12';
         octx.lineWidth = 4;
@@ -14037,8 +14066,6 @@ async function scanLoop(epoch) {
       }
       if (text) reasm.ingest(text, 'camera');
     }
-    const elapsed = performance.now() - t0;
-    await new Promise((r) => setTimeout(r, Math.max(0, MIN_INTERVAL - elapsed)));
   }
 }
 function setStatus(msg, isError) {
