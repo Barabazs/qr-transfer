@@ -17,9 +17,12 @@ Ethereum Swarm.
   frame). Any repair frame can patch whatever the receiver is missing, so a missed frame
   never costs another full loop. Frames are generated live — no pre-render stall on
   large payloads.
-- **Receive**: live camera scanning — adaptive rate (scans as fast as decode completes,
-  up to ~40 Hz) with the native `BarcodeDetector` API where available (Android Chrome)
-  and jsQR everywhere else — or dropped/uploaded QR images, fed through a GF(2)
+- **Receive**: live camera scanning — one decode per new camera frame (as fast as decode
+  completes, up to the camera's frame rate; a ~40 Hz timer in browsers without
+  `requestVideoFrameCallback`) with the native `BarcodeDetector` API where available
+  (Android Chrome) and jsQR everywhere else; jsQR reads only the centre square of the
+  camera image, outlined with a dashed guide on the preview — or dropped/uploaded QR
+  images, fed through a GF(2)
   elimination decoder: a receiver missing m chunks needs about m + 2 repair frames,
   whichever ones it catches. Output is the received container as base64 (the Encoded data box), plus a
   decode panel (image preview / text / download). Before showing anything, the receiver
