@@ -424,15 +424,15 @@ footer a { color: var(--ink); text-underline-offset: 2px; }
   </details>
   <details>
     <summary>How much can I send?</summary>
-    <p>One QR code holds up to 2,331 encoded bytes (about 1.7&nbsp;KB of file). Past that, payloads stream in up to 9,999
-    chunks: roughly 1.9, 4.77 or 7.6&nbsp;MB encoded at 200, 500 or 800-byte frames.
-    Base64 adds a third on top, so a 75&nbsp;KB file already trips the 100&nbsp;KB
+    <p>One QR code holds a container of up to 2,254 bytes (about 2.2&nbsp;KB of file, minus its
+    name and type). Past that, files stream in up to 9,999 chunks: roughly 1.9, 4.77 or
+    7.6&nbsp;MB at 200, 500 or 800-byte frames. Anything over 100&nbsp;KB gets a
     warning. Small transfers stay pleasant; multi-hundred-KB ones mean minutes of holding
     the phone still.</p>
   </details>
   <details>
     <summary>Can a normal scanner app read these codes?</summary>
-    <p>No. Every code, even a single one, is a <code>QRC|</code> frame carrying a base64
+    <p>No. Every code, even a single one, is a <code>QRD|</code> frame carrying a Base45
     container. Use this app to read them.</p>
   </details>
   <details>
@@ -474,8 +474,8 @@ footer a { color: var(--ink); text-underline-offset: 2px; }
 </section>
 
 <footer>
-  Every code is a <span style="font-family:var(--mono)">QRC</span> frame; bigger payloads stream
-  as <span style="font-family:var(--mono)">QRC</span> fountain frames: after a first pass through the
+  Every code is a <span style="font-family:var(--mono)">QRD</span> frame; bigger payloads stream
+  as <span style="font-family:var(--mono)">QRD</span> fountain frames: after a first pass through the
   chunks, endless XOR repair frames follow, and <em>any</em> of them can patch what the receiver is
   missing — a missed frame never costs another full loop. Nothing leaves your device.
   A CRC-32 checks every finished transfer against accidental damage; still keep the original
