@@ -426,9 +426,11 @@ footer a { color: var(--ink); text-underline-offset: 2px; }
     <summary>How much can I send?</summary>
     <p>One QR code holds a container of up to 2,254 bytes (about 2.2&nbsp;KB of file, minus its
     name and type). Past that, files stream in up to 9,999 chunks: roughly 1.9, 4.77 or
-    7.6&nbsp;MB at 200, 500 or 800-byte frames. Anything over 100&nbsp;KB gets a
-    warning. Small transfers stay pleasant; multi-hundred-KB ones mean minutes of holding
-    the phone still.</p>
+    7.6&nbsp;MB at 200, 500 or 800-byte frames. Anything over 100&nbsp;KB to send
+    (after any compression) gets a warning. Small transfers stay pleasant; multi-hundred-KB
+    ones mean minutes of holding the phone still. Text, CSV, JSON and other compressible files
+    are gzip-compressed first and often shrink several-fold; photos, video and archives are
+    already compressed and go as they are.</p>
   </details>
   <details>
     <summary>Can a normal scanner app read these codes?</summary>
@@ -443,7 +445,8 @@ footer a { color: var(--ink); text-underline-offset: 2px; }
   <details>
     <summary>Is the transfer verified?</summary>
     <p>Yes, against accidental damage. The file travels in a container with a CRC-32 over
-    its name, type, size and bytes. The receiver checks it before offering the result, and
+    its name, type, size and bytes as sent (a compressed body is checked again by gzip's own
+    CRC-32 after decompression). The receiver checks it before offering the result, and
     a mismatch restarts the transfer. CRC-32 catches misreads, not deliberate tampering: it
     is not a cryptographic hash.</p>
   </details>
